@@ -1,0 +1,88 @@
+experiment:
+  name: spvd_text_cued_vitb16_cc3m
+  output_dir: outputs/spvd_text_cued_vitb16_cc3m
+  seed: 42
+
+data:
+  root: /vepfs/dataset/cc3m_longcaption
+  type: webdataset
+  train_data: /vepfs/dataset/cc3m_longcaption/cc3m-train-{0000..0575}.tar
+  train_num_samples: 2823423
+  val_data: null
+  image_key: jpg
+  caption_key: txt
+  # Rewritten tar files store longSV in .txt and all caption variants in .json.
+  # Failed relabels stay in the shards and are skipped by the loader, matching FLAIR's WebDataset select(json+image) path.
+  filter_relabel_success: true
+  relabel_success_key: longSV
+  strict_caption_match: true
+  num_sampled_captions: 4
+  max_merged_num: 3
+  long_caption_file: null
+  long_caption_index: null
+  metadata_key: null
+  batch_size: 640
+  num_workers: 24
+  prefetch_factor: 2
+  sample_shuffle_size: 5000
+  sample_shuffle_initial: 1000
+  shard_shuffle_size: 2000
+  shard_shuffle_initial: 500
+  persistent_workers: true
+  pin_memory: true
+  tar_mode: r|*
+  tokenize_in_collate: false
+  shuffle: true
+
+model:
+  # Project-local construction: this name is resolved from
+  # src/model_configs/SPVD-ViT-B-16.json.
+  name: SPVD-ViT-B-16
+  pretrained: ""
+  embed_dim: 512
+  image_size: 224
+  output_dict: true
+  normalize: true
+
+loss:
+  name: spvd
+  lambda_dec: 0.05
+  lambda_pri: 0.10
+  lambda_dis: 0.01
+  lambda_sem: 0.05
+  dec_rho: 0.6
+  sem_temperature: 0.07
+  sem_topk: null
+  private_loss_type: cosine
+  dis_loss_type: covariance
+
+optim:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.2
+  betas: [0.9, 0.98]
+  eps: 1.0e-6
+  epochs: 32
+  warmup_steps: 2000
+  grad_accum_steps: 1
+  amp: true
+
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+
+logging:
+  log_interval: 50
+  save_interval: 1
+  report_to: none
+
+diagnostics:
+  enabled: true
+  log_interval: 50
+  heavy_log_interval: 500
+  per_layer: true
+  log_update_rms: true
+  log_effective_rank: true
+  log_redundancy: true
+  max_logged_layers: 80
+  eps: 1.0e-12

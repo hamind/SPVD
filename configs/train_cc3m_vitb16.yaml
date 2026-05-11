@@ -1,0 +1,85 @@
+experiment:
+  name: clip_vitb16_cc3m
+  output_dir: outputs/clip_vitb16_cc3m
+  seed: 42
+
+data:
+  root: /vepfs/dataset/cc3m_longcaption
+  type: webdataset
+  train_data: /vepfs/dataset/cc3m_longcaption/cc3m-train-{0000..0575}.tar
+  train_num_samples: 2823423
+  # No validation split was detected under /vepfs/dataset/cc3m.
+  # Set this to a validation shard pattern if one is prepared.
+  val_data: null
+  image_key: jpg
+  caption_key: txt
+  # Rewritten tar files store longSV in .txt and all caption variants in .json.
+  # Failed relabels stay in the shards and are skipped by the loader, matching FLAIR's WebDataset select(json+image) path.
+  filter_relabel_success: true
+  relabel_success_key: longSV
+  strict_caption_match: true
+  num_sampled_captions: 4
+  max_merged_num: 3
+  long_caption_file: null
+  long_caption_index: null
+  metadata_key: null
+  batch_size: 640
+  num_workers: 24
+  prefetch_factor: 2
+  sample_shuffle_size: 5000
+  sample_shuffle_initial: 1000
+  shard_shuffle_size: 2000
+  shard_shuffle_initial: 500
+  persistent_workers: true
+  pin_memory: true
+  tar_mode: r|*
+  tokenize_in_collate: false
+  shuffle: true
+
+model:
+  name: clip_vitb16
+  openclip_model: ViT-B-16
+  vision_backbone: vit_base_patch16_224
+  embed_dim: 512
+  image_size: 224
+  text_width: 512
+  text_layers: 12
+  text_heads: 8
+  context_length: 77
+  vocab_size: 49408
+  learnable_logit_scale: true
+  init_logit_scale: 2.659260036932778
+  tokenizer: open_clip
+  tokenizer_model: ViT-B-16
+
+loss:
+  name: clip
+
+regularization:
+  use_uniformity: false
+  uniformity_weight: 0.0
+  use_variance: false
+  variance_weight: 0.0
+  use_covariance: false
+  covariance_weight: 0.0
+  use_effective_rank: false
+  effective_rank_weight: 0.0
+
+optim:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.2
+  betas: [0.9, 0.98]
+  eps: 1.0e-6
+  epochs: 32
+  warmup_steps: 2000
+  grad_accum_steps: 1
+  amp: true
+
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+
+logging:
+  log_interval: 50
+  save_interval: 1

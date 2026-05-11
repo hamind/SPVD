@@ -1,0 +1,49 @@
+dataset_root: /vepfs/dataset/benchmarks
+model_root: /vepfs/model
+output_dir: outputs/benchmark_eval
+conda_env: openclip
+device: cuda
+dtype: fp32
+batch_size: 64
+num_workers: 8
+random_seed: 42
+dry_run_limit: 8
+compute_random_negative: true
+save_figures: true
+
+benchmarks:
+  enabled:
+    - aro
+    - sugarcrepe
+    - winoground
+  aro:
+    root: /vepfs/dataset/benchmarks/aro
+    order_splits:
+      - test
+      - val
+    order_max_words: 30
+  sugarcrepe:
+    root: /vepfs/dataset/benchmarks/sugarcrepe
+  winoground:
+    root: /vepfs/dataset/benchmarks/winoground
+
+models:
+  - name: clip_vit_b32_openai
+    model_type: open_clip
+    model_name: ViT-B-32
+    pretrained: openai
+    checkpoint_file: ViT-B-32.pt
+    force_quick_gelu: true
+
+  - name: openclip_vit_b32_laion2b
+    model_type: open_clip
+    model_name: ViT-B-32
+    pretrained: laion2b_s34b_b79k
+    checkpoint_file: open_clip_model.safetensors
+
+  # Enable when an SPVD checkpoint exists.
+  # - name: spvd_soft_cue_vitb16
+  #   model_type: spvd
+  #   model_name: SPVD-ViT-B-16
+  #   checkpoint_path: /vepfs/code/SPVD/outputs/spvd_soft_cue_vitb16_cc3m/checkpoints/epoch_0001.pt
+  #   image_size: 224
