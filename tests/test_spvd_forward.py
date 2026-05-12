@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from open_clip.model import CLIP
 
 from factory import create_model_and_transforms, create_tokenizer, get_model_config, list_models
@@ -142,6 +143,51 @@ def test_spvd_sigmoid_branch_bce_one_batch_backward() -> None:
     assert decomp.semantic_value_proj.weight.grad is not None
     assert decomp.residual_value_proj.weight.grad is not None
     assert decomp.gate_bias.grad is not None
+
+
+def test_spvd_wrapper_cached_conditioned_score_uses_semantic_features() -> None:
+    model, _, _ = create_model_and_transforms(
+        "SPVD-ViT-B-16",
+        pretrained="",
+        precision="fp32",
+        device="cpu",
+        force_image_size=32,
+        output_dict=True,
+        config_dict={
+            "model": {
+                "enable_soft_cue_decomp": True,
+                "use_finegrained_text_cue": True,
+                "text_cue_type": "soft_cue",
+                "num_soft_cues": 4,
+                "soft_cue_num_heads": 4,
+                "soft_cue_num_layers": 1,
+            }
+        },
+    )
+    tokenizer = create_tokenizer("SPVD-ViT-B-16")
+    images = torch.randn(2, 3, 32, 32)
+    texts = tokenizer(["a small image", "another tiny image"])
+
+    image_outputs = model.encode_image(images, normalize=False, return_tokens=True)
+    text_outputs = model.encode_text(texts, normalize=True, return_tokens=True)
+    image_tokens = image_outputs["image_tokens"]
+    soft_cues = text_outputs.get("soft_cues")
+    if soft_cues is None:
+        soft_cues = text_outputs["cue"]
+    text_features = text_outputs["text_global"]
+
+    decomp_outputs = model.soft_cue_decomposition(image_tokens, soft_cues)
+
+    assert "semantic_features" in decomp_outputs
+    assert "residual_features" in decomp_outputs
+    assert decomp_outputs["semantic_features"].shape == text_features.shape
+
+    semantic_features = F.normalize(decomp_outputs["semantic_features"].float(), dim=-1)
+    text_features = F.normalize(text_features.float(), dim=-1)
+    scores = (semantic_features * text_features).sum(dim=-1)
+
+    assert scores.shape == (2,)
+    assert torch.isfinite(scores).all()
 
 
 def test_spvd_soft_cue_forward_accepts_multi_caption_text() -> None:

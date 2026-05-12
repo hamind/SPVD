@@ -110,14 +110,14 @@ def test_spvd_loss_prefers_flattened_caption_sigmoid_alignment() -> None:
 
     loss, loss_dict = loss_fn(outputs)
     expected_global = OpenCLIPSigLipLoss(rank=0, world_size=1)(
-        image_features,
-        text_features,
+        F.normalize(image_features.float(), dim=-1),
+        F.normalize(text_features.float(), dim=-1),
         logit_scale,
         None,
     )
     expected_caption = OpenCLIPSigLipLoss(rank=0, world_size=1)(
-        caption_visual_features.reshape(-1, 8),
-        caption_text_features.reshape(-1, 8),
+        F.normalize(caption_visual_features.reshape(-1, 8).float(), dim=-1),
+        F.normalize(caption_text_features.reshape(-1, 8).float(), dim=-1),
         logit_scale,
         None,
     )

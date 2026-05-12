@@ -658,7 +658,14 @@ class SPVDWrapper(FrozenVLMWrapper):
         text_features = text_features.to(self.device, non_blocking=True)
         with self._autocast_context():
             decomp_outputs = self.model.soft_cue_decomposition(image_tokens, soft_cues)
-            shared_features = decomp_outputs["shared_visual_features"]
+            shared_features = decomp_outputs.get("shared_visual_features")
+            if shared_features is None:
+                shared_features = decomp_outputs.get("semantic_features")
+            if shared_features is None:
+                raise KeyError(
+                    "SPVD decomposition output must contain either 'semantic_features' "
+                    "or backward-compatible 'shared_visual_features'."
+                )
         shared_features = F.normalize(shared_features.float(), dim=-1)
         text_features = F.normalize(text_features.float(), dim=-1)
         scores = (shared_features * text_features).sum(dim=-1)

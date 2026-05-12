@@ -1,4 +1,4 @@
-"""Benchmark evaluation launcher for SPVD semantic-preservation diagnostics."""
+"""Benchmark evaluation launcher for SPVD text-conditioned image-text matching diagnostics."""
 
 from __future__ import annotations
 

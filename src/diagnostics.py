@@ -294,8 +294,7 @@ def compute_logits_stats(outputs: Any, eps: float = 1.0e-12) -> dict[str, float]
     if torch.is_tensor(logit_scale) and logit_scale.numel() == 1:
         scale = logit_scale.detach().float()
         stats["train/logit_scale"] = _finite_float(scale)
-        stats["train/logit_scale_exp"] = _finite_float(scale.exp())
-        stats["train/temperature"] = _finite_float(1.0 / scale.exp().clamp_min(eps))
+        stats["train/temperature"] = _finite_float(1.0 / scale.clamp_min(eps))
     if torch.is_tensor(temperature) and temperature.numel() == 1:
         stats["train/temperature"] = _finite_float(temperature)
     if torch.is_tensor(image) and torch.is_tensor(text) and image.ndim == 2 and text.ndim == 2 and image.shape[0] == text.shape[0]:
