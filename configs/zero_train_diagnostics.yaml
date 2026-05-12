@@ -1,15 +1,30 @@
-dataset_root: /vepfs/dataset
+dataset_root: /vepfs/dataset/benchmark
 model_root: /vepfs/model
 output_dir: outputs/zero_train_diagnostics
 conda_env: openclip
 device: cuda
-dtype: fp32
+dtype: bf16
 batch_size: 64
 num_workers: 8
+distributed_eval: false
+num_workers_per_gpu: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+pair_chunk_size: 8192
+perf_log_interval: 20
+write_perf_jsonl: true
 random_seed: 42
 dry_run_limit: 8
 compute_random_negative: true
 save_figures: true
+
+eval_mode:
+  spvd_pairwise_mode: exact_cached
+  retrieval_mode: global
+  rerank_topk: 100
+  score_chunk: 8192
+  pair_chunk_size: 8192
 
 benchmarks:
   enabled:
@@ -17,41 +32,37 @@ benchmarks:
     - sugarcrepe
     - winoground
   aro:
-    root:
+    root: /vepfs/dataset/benchmark/aro
     order_splits:
       - test
       - val
     order_max_words: 30
   sugarcrepe:
-    root:
+    root: /vepfs/dataset/benchmark/sugarcrepe
   winoground:
-    root:
+    root: /vepfs/dataset/benchmark/winoground
 
 models:
   - name: clip_vit_b32_openai
-    model_type: open_clip
-    model_name: ViT-B-32
-    pretrained: openai
-    checkpoint_file: ViT-B-32.pt
-    force_quick_gelu: true
+    model_type: hf_clip
+    local_dir: /vepfs/model/openai_clip_vit_b_32
 
   - name: clip_vit_l14_openai
-    model_type: open_clip
-    model_name: ViT-L-14
-    pretrained: openai
-    checkpoint_file: ViT-L-14.pt
-    force_quick_gelu: true
+    model_type: hf_clip
+    local_dir: /vepfs/model/openai_clip_vit_l_14
 
   - name: openclip_vit_b32_laion2b
     model_type: open_clip
     model_name: ViT-B-32
     pretrained: laion2b_s34b_b79k
+    local_dir: /vepfs/model/openclip_vit_b_32_laion2b_s34b_b79k
     checkpoint_file: open_clip_model.safetensors
 
   - name: openclip_vit_h14_laion2b
     model_type: open_clip
     model_name: ViT-H-14
     pretrained: laion2b_s32b_b79k
+    local_dir: /vepfs/model/openclip_vit_h_14_laion2b_s32b_b79k
     checkpoint_file: open_clip_model.safetensors
 
   - name: siglip_so400m_p14_384

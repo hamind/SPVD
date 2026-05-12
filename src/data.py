@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import io
 import json
 import logging
 import math
@@ -11,10 +10,8 @@ import os
 import random
 import re
 import sqlite3
-import tarfile
 import time
-from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,12 +19,12 @@ from typing import Any
 import torch
 import webdataset as wds
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset
 
 from open_clip_train.data import ResampledShards2, SharedEpoch, detshuffle2, get_dataset_size
 from open_clip_train.data import group_by_keys_nothrow, tar_file_expander, url_opener
 
-from distributed import get_rank, get_world_size
+from distributed import get_world_size
 
 
 _NUMERIC_BRACE_RE = re.compile(r"\{(\d+)\.\.(\d+)(?:\.\.(-?\d+))?\}")

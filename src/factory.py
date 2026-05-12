@@ -113,8 +113,7 @@ def _create_spvd_model(
     from open_clip.factory import load_checkpoint
     from open_clip.transform import PreprocessCfg, merge_preprocess_dict
 
-    from clip_components import convert_weights_to_lp, get_cast_dtype, set_model_preprocess_cfg
-    from model import SPVDModel
+    from model import SPVDModel, convert_weights_to_lp, get_cast_dtype, set_model_preprocess_cfg
 
     model_cfg = get_model_config(model_name)
     if model_cfg is None:
@@ -302,6 +301,7 @@ def create_loss(args: object) -> nn.Module:
             global_align_weight=float(getattr(args, "global_align_weight", 1.0)),
             caption_align_weight=float(getattr(args, "caption_align_weight", 1.0)),
             loss_dist_impl=getattr(args, "loss_dist_impl", None),
+            debug_finite_checks=bool(getattr(args, "debug_finite_checks", False)),
         )
     if bool(getattr(args, "siglip", False)) or loss_name in {"siglip", "sigmoid", "sigmoid_pairwise"}:
         return SigLipLoss(

@@ -143,13 +143,14 @@ def test_spvd_loss_soft_cue_terms_are_finite() -> None:
     image_features = torch.randn(5, 8, requires_grad=True)
     text_features = torch.randn(5, 8, requires_grad=True)
     residual_features = torch.randn(5, 8, requires_grad=True)
-    routing_probs = torch.softmax(torch.randn(5, 4, 6, 2), dim=-1)
+    routing_logits = torch.randn(5, 4, 6, requires_grad=True)
     outputs = {
         "image_features": image_features,
         "text_features": text_features,
         "residual_visual_features": residual_features,
-        "shared_routing": routing_probs[..., 0].requires_grad_(),
-        "residual_routing": routing_probs[..., 1].requires_grad_(),
+        "routing_logits": routing_logits,
+        "shared_routing": torch.sigmoid(routing_logits),
+        "residual_routing": torch.sigmoid(-routing_logits),
         "relevance_scores": torch.rand(5, 4, 6),
         "cue_weights": torch.softmax(torch.randn(5, 4), dim=-1),
         "logit_scale": torch.tensor(10.0),
@@ -171,3 +172,4 @@ def test_spvd_loss_soft_cue_terms_are_finite() -> None:
     assert image_features.grad is not None
     assert text_features.grad is not None
     assert residual_features.grad is not None
+    assert routing_logits.grad is not None

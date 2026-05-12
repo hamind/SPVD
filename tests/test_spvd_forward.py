@@ -64,7 +64,9 @@ def test_spvd_soft_cue_forward_shapes() -> None:
 
     assert outputs["image_features"].shape == (2, model.embed_dim)
     assert outputs["text_features"].shape == (2, model.embed_dim)
+    assert outputs["cue"].shape == (2, 4, model.embed_dim)
     assert outputs["soft_cues"].shape == (2, 4, model.embed_dim)
+    assert torch.allclose(outputs["cue"], outputs["soft_cues"])
     assert outputs["relevance_scores"].shape == (2, 4, 4)
     assert outputs["shared_routing"].shape == (2, 4, 4)
     assert outputs["residual_routing"].shape == (2, 4, 4)
@@ -109,7 +111,9 @@ def test_spvd_soft_cue_forward_accepts_multi_caption_text() -> None:
     assert outputs["text_features"].shape == (2, model.embed_dim)
     assert outputs["text_tokens"].shape == (2, 3, texts.shape[-1], model.text_dim)
     assert outputs["caption_text_features"].shape == (2, 3, model.embed_dim)
+    assert outputs["cue"].shape == (2, 3, 4, model.embed_dim)
     assert outputs["soft_cues"].shape == (2, 3, 4, model.embed_dim)
+    assert torch.allclose(outputs["cue"], outputs["soft_cues"])
     assert outputs["image_attention"].shape == (2, 3, 4, 4)
     assert outputs["relevance_scores"].shape == (2, 3, 4, 4)
     assert outputs["cue_visual_features"].shape == (2, 3, 4, model.embed_dim)
@@ -147,5 +151,42 @@ def test_spvd_no_soft_cue_does_not_register_unused_extractor() -> None:
     outputs = model(images, texts, output_dict=True)
 
     assert not hasattr(model, "soft_cue_extractor")
+    assert outputs["cue"].shape == (2, 3, 1, model.embed_dim)
     assert outputs["soft_cues"].shape == (2, 3, 1, model.embed_dim)
+    assert torch.allclose(outputs["cue"], outputs["soft_cues"])
     assert outputs["caption_shared_visual_features"].shape == (2, 3, model.embed_dim)
+
+
+def test_encode_text_returns_text_global_and_cue() -> None:
+    model, _, _ = create_model_and_transforms(
+        "SPVD-ViT-B-16",
+        pretrained="",
+        precision="fp32",
+        device="cpu",
+        force_image_size=32,
+        output_dict=True,
+        config_dict={
+            "model": {
+                "enable_soft_cue_decomp": True,
+                "num_soft_cues": 4,
+                "soft_cue_num_heads": 4,
+                "soft_cue_num_layers": 1,
+            }
+        },
+    )
+    tokenizer = create_tokenizer("SPVD-ViT-B-16")
+    texts = tokenizer([
+        "a small image",
+        "a tiny picture",
+        "a compact scene",
+        "another tiny image",
+        "another small picture",
+        "another compact scene",
+    ]).reshape(2, 3, -1)
+
+    outputs = model.encode_text(texts, normalize=True, return_tokens=True)
+
+    assert outputs["text_global"].shape == (2, 3, model.embed_dim)
+    assert outputs["cue"].shape == (2, 3, 4, model.embed_dim)
+    assert torch.allclose(outputs["cue"], outputs["soft_cues"])
+    assert outputs["text_tokens"].shape == (2, 3, texts.shape[-1], model.text_dim)

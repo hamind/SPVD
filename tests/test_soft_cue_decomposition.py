@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import torch
 
-from conditional_decomposition import SoftCueBidirectionalDecomposition
 from losses import (
     bidirectional_routing_bce_loss,
     residual_preservation_loss,
     shared_residual_decorrelation_loss,
 )
-from soft_cue import SoftCueExtractor
+from model import SoftCueBidirectionalDecomposition, SoftCueExtractor
 
 
 def test_soft_cue_decomposition_shapes_bounds_and_backward() -> None:
@@ -40,8 +39,11 @@ def test_soft_cue_decomposition_shapes_bounds_and_backward() -> None:
     outputs = decomposition(visual_tokens, soft_cues)
 
     rho = outputs["relevance_scores"]
+    routing_logits = outputs["routing_logits"]
     m_s = outputs["shared_routing"]
     m_r = outputs["residual_routing"]
+    routing_probs = outputs["routing_probs"]
+    routing_pair_logits = outputs["routing_pair_logits"]
     z_s_k = outputs["cue_visual_features"]
     z_r_k = outputs["cue_residual_features"]
     z_s = outputs["shared_visual_features"]
@@ -50,8 +52,11 @@ def test_soft_cue_decomposition_shapes_bounds_and_backward() -> None:
 
     assert soft_cues.shape == (batch_size, num_cues, dim)
     assert rho.shape == (batch_size, num_cues, num_tokens)
+    assert routing_logits.shape == (batch_size, num_cues, num_tokens)
     assert m_s.shape == (batch_size, num_cues, num_tokens)
     assert m_r.shape == (batch_size, num_cues, num_tokens)
+    assert routing_probs.shape == (batch_size, num_cues, num_tokens, 2)
+    assert routing_pair_logits.shape == (batch_size, num_cues, num_tokens, 2)
     assert z_s_k.shape == (batch_size, num_cues, dim)
     assert z_r_k.shape == (batch_size, num_cues, dim)
     assert z_s.shape == (batch_size, dim)

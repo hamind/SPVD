@@ -6,8 +6,6 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-
 from checkpoint import load_checkpoint
 from data import build_dataloader
 from distributed import cleanup_distributed, init_distributed_device, is_master

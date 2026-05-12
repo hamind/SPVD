@@ -10,20 +10,28 @@ from torch import nn
 from torch.optim import Optimizer
 
 
-def save_checkpoint(path: str | Path, model: nn.Module, optimizer: Optimizer, epoch: int, step: int, args: object) -> None:
+def save_checkpoint(
+    path: str | Path,
+    model: nn.Module,
+    optimizer: Optimizer,
+    epoch: int,
+    step: int,
+    args: object,
+    scaler: Any | None = None,
+) -> None:
     """Save a training checkpoint."""
     ckpt_path = Path(path)
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "step": step,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "args": vars(args),
-        },
-        ckpt_path,
-    )
+    payload = {
+        "epoch": epoch,
+        "step": step,
+        "state_dict": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "args": vars(args),
+    }
+    if scaler is not None:
+        payload["scaler"] = scaler.state_dict()
+    torch.save(payload, ckpt_path)
 
 
 def load_checkpoint(path: str | Path, model: nn.Module, optimizer: Optimizer | None = None, map_location: Any = "cpu") -> dict[str, Any]:

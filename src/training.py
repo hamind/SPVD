@@ -197,7 +197,7 @@ def train_one_epoch(
         images = batch["image"].to(device, non_blocking=True)
         texts = batch["text"].to(device, non_blocking=True)
         if scheduler is not None:
-            scheduler(optimizer_steps)
+            scheduler(global_step_offset + optimizer_steps)
         with _autocast(args):
             outputs = model(images, texts)
             raw_loss, loss_dict = _compute_loss(loss_fn, outputs, args, device)

@@ -187,6 +187,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--diagnostics-log-redundancy", action=argparse.BooleanOptionalAction, default=bool(_default_from_config(config, "diagnostics", "log_redundancy", True)))
     parser.add_argument("--diagnostics-max-logged-layers", type=int, default=_default_from_config(config, "diagnostics", "max_logged_layers", 80))
     parser.add_argument("--diagnostics-eps", type=float, default=_default_from_config(config, "diagnostics", "eps", 1.0e-12))
+    parser.add_argument(
+        "--debug-finite-checks",
+        action=argparse.BooleanOptionalAction,
+        default=bool(
+            _default_from_config(
+                config,
+                "training",
+                "debug_finite_checks",
+                _default_from_config(config, "logging", "debug_finite_checks", False),
+            )
+        ),
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=_default_from_config(config, "experiment", "seed", 42))
     parser.add_argument("--dry-run", action="store_true")

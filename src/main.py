@@ -39,6 +39,14 @@ def _write_params(path: Path, args: object) -> None:
             handle.write(f"{name}: {getattr(args, name)}\n")
 
 
+def _optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """Move restored optimizer tensors to the active training device."""
+    for state in optimizer.state.values():
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                state[name] = value.to(device)
+
+
 def _resolved_config(args: object) -> dict[str, object]:
     """Return YAML-safe resolved arguments."""
     resolved: dict[str, object] = {}
@@ -109,9 +117,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         loss_fn = create_loss(args).to(args.device)
         model = model.to(args.device)
 
+        resume_payload = None
+        resume_epoch = 0
+        resume_step = 0
         if args.resume:
-            load_checkpoint(args.resume, model, map_location=args.device)
-            logger.info("resumed checkpoint: %s", args.resume)
+            resume_payload = load_checkpoint(args.resume, model, map_location=args.device)
+            resume_epoch = int(resume_payload.get("epoch", 0) or 0)
+            resume_step = int(resume_payload.get("step", 0) or 0)
+            logger.info("loaded checkpoint model state: %s (epoch=%d, step=%d)", args.resume, resume_epoch, resume_step)
 
         if args.distributed:
             model = DistributedDataParallel(model, device_ids=[args.local_rank] if args.device.type == "cuda" else None)
@@ -125,14 +138,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         total_steps = max(steps_per_epoch * int(args.epochs), 1)
         scheduler = cosine_lr(optimizer, float(args.lr), int(args.warmup), total_steps)
         scaler = GradScaler(enabled=str(args.precision).startswith("amp") and args.device.type == "cuda")
+        if resume_payload is not None:
+            if "optimizer" in resume_payload:
+                optimizer.load_state_dict(resume_payload["optimizer"])
+                _optimizer_to_device(optimizer, args.device)
+                logger.info("resumed optimizer state from: %s", args.resume)
+            else:
+                logger.warning("checkpoint has no optimizer state; resume will behave like weight initialization")
+            if "scaler" in resume_payload and scaler.is_enabled():
+                scaler.load_state_dict(resume_payload["scaler"])
+                logger.info("resumed AMP scaler state from: %s", args.resume)
 
         if args.dry_run:
             logger.info("dry run complete")
             return
 
-        global_step = 0
+        global_step = resume_step
+        start_epoch = resume_epoch + 1 if args.resume else 1
         save_frequency = max(int(getattr(args, "save_frequency", 0) or 0), 0)
-        for epoch in range(1, int(args.epochs) + 1):
+        if start_epoch > int(args.epochs):
+            logger.info("resume checkpoint epoch %d already reached configured epochs=%d", resume_epoch, int(args.epochs))
+            return
+        logger.info("starting training at epoch=%d, global_step=%d", start_epoch, global_step)
+        for epoch in range(start_epoch, int(args.epochs) + 1):
             train_info.set_epoch(epoch)
             steps = train_one_epoch(model, train_info.dataloader, loss_fn, optimizer, scaler, scheduler, epoch, args, logger, writer, global_step)
             global_step += steps
@@ -140,11 +168,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             is_final_epoch = epoch == int(args.epochs)
             if is_master(args) and save_frequency > 0 and epoch % save_frequency == 0:
                 ckpt = log_dir / "checkpoints" / f"epoch_{epoch:04d}.pt"
-                save_checkpoint(ckpt, unwrap_model(model), optimizer, epoch, global_step, args)
+                save_checkpoint(ckpt, unwrap_model(model), optimizer, epoch, global_step, args, scaler=scaler)
                 logger.info("saved checkpoint: %s", ckpt)
             if is_master(args) and (is_final_epoch or reached_step_limit):
                 ckpt = log_dir / "checkpoints" / "epoch_final.pt"
-                save_checkpoint(ckpt, unwrap_model(model), optimizer, epoch, global_step, args)
+                save_checkpoint(ckpt, unwrap_model(model), optimizer, epoch, global_step, args, scaler=scaler)
                 logger.info("saved final checkpoint: %s", ckpt)
             if reached_step_limit:
                 break

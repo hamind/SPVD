@@ -219,6 +219,31 @@ def compute_redundancy_stats(zs: Tensor | None, zp: Tensor | None, eps: float = 
     return stats
 
 
+def tensor_stats(prefix: str, tensor: Tensor) -> dict[str, float]:
+    """Return finite-only min/max/mean/std plus a non-finite count."""
+    x = tensor.detach()
+    finite = torch.isfinite(x)
+    base_name = prefix.split("/")[-1]
+    if prefix.startswith("train/"):
+        nonfinite_key = f"train/nonfinite_{base_name}_count"
+    else:
+        nonfinite_key = f"{prefix}_nonfinite_count"
+    stats = {
+        nonfinite_key: float((~finite).sum().item()),
+    }
+    if finite.any():
+        xf = x[finite].float()
+        stats.update(
+            {
+                f"{prefix}_min": float(xf.min().item()),
+                f"{prefix}_max": float(xf.max().item()),
+                f"{prefix}_mean": float(xf.mean().item()),
+                f"{prefix}_std": float(xf.std(unbiased=False).item()),
+            }
+        )
+    return stats
+
+
 @torch.no_grad()
 def collect_feature_tensors(outputs: Any) -> dict[str, Tensor]:
     """Best-effort feature discovery from model outputs without assuming one schema."""
@@ -253,6 +278,10 @@ def compute_logits_stats(outputs: Any, eps: float = 1.0e-12) -> dict[str, float]
         return None
 
     if isinstance(outputs, dict):
+        for name in ("routing_logits", "shared_routing", "residual_routing", "relevance_scores"):
+            value = outputs.get(name)
+            if torch.is_tensor(value):
+                stats.update(tensor_stats(f"train/{name}", value))
         image = first_tensor(outputs, ("image_features", "z_v_s", "shared_global"))
         text = first_tensor(outputs, ("text_features", "z_t", "text_global"))
         logit_scale = outputs.get("logit_scale")

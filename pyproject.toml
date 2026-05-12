@@ -24,7 +24,6 @@ dependencies = [
 [tool.setuptools]
 py-modules = [
   "checkpoint",
-  "clip_components",
   "data",
   "distributed",
   "factory",
