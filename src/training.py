@@ -64,6 +64,15 @@ def _autocast(args: object):
     return torch.autocast("cuda", dtype=dtype, enabled=enabled)
 
 
+
+def _normalize_retrieval_features(features: torch.Tensor) -> torch.Tensor:
+    """Return 2D L2-normalized features before retrieval dot products."""
+    if features.ndim == 3:
+        features = features.mean(dim=1)
+    if features.ndim != 2:
+        raise ValueError(f"Retrieval features must be 2D or 3D, got shape={tuple(features.shape)}.")
+    return torch.nn.functional.normalize(features.float(), dim=-1)
+
 def _unpack_outputs(outputs: Any, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Normalize OpenCLIP output formats."""
     if isinstance(outputs, dict):
@@ -109,9 +118,17 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
         "loss_sigmoid": "loss_align",
         "loss_align_global": "loss_align_global",
         "loss_align_caption": "loss_align_caption",
-        "loss_dec": "loss_compress",
-        "loss_decomp": "loss_compress",
-        "loss_residual": "loss_private",
+        "loss_branch": "loss_branch",
+        "loss_branch_s_text": "loss_branch_s_text",
+        "loss_branch_r_text": "loss_branch_r_text",
+        "branch_sim_s_text": "branch_sim_s_text",
+        "branch_sim_r_text": "branch_sim_r_text",
+        "branch_gap_s_minus_r": "branch_gap_s_minus_r",
+        "loss_residual_variance": "loss_residual_variance",
+        "gate_mean": "gate_mean",
+        "gate_std": "gate_std",
+        "gate_min": "gate_min",
+        "gate_max": "gate_max",
         "loss_pri": "loss_private",
         "loss_private": "loss_private",
         "loss_dis": "loss_dis",
@@ -300,7 +317,17 @@ def train_one_epoch(
                 "loss_sigmoid",
                 "loss_align_global",
                 "loss_align_caption",
-                "loss_dec",
+                "loss_branch",
+                "loss_branch_s_text",
+                "loss_branch_r_text",
+                "branch_sim_s_text",
+                "branch_sim_r_text",
+                "branch_gap_s_minus_r",
+                "loss_residual_variance",
+                "gate_mean",
+                "gate_std",
+                "gate_min",
+                "gate_max",
                 "loss_pri",
                 "loss_dis",
                 "loss_sem",
@@ -354,8 +381,8 @@ def extract_features(model: nn.Module, data_loader: Any, device: torch.device) -
     for batch in data_loader:
         outputs = model(batch["image"].to(device), batch["text"].to(device))
         image, text, _, _ = _unpack_outputs(outputs, device)
-        image_features.append(image.cpu())
-        text_features.append(text.cpu())
+        image_features.append(_normalize_retrieval_features(image).cpu())
+        text_features.append(_normalize_retrieval_features(text).cpu())
     if not image_features:
         raise ValueError("Dataloader produced no samples.")
-    return torch.cat(image_features), torch.cat(text_features)
+    return torch.cat(image_features, dim=0), torch.cat(text_features, dim=0)

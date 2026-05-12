@@ -194,6 +194,8 @@ def create_model(
             "soft_cue_dropout",
             "relevance_temperature",
             "routing_temperature",
+            "gate_temperature",
+            "gate_bias_init",
             "use_global_image_head",
             "normalize_outputs",
             "return_patch_tokens",
@@ -277,8 +279,8 @@ get_tokenizer = create_tokenizer
 
 def create_loss(args: object) -> nn.Module:
     """Create CLIP, SigLIP, or SPVD loss."""
-    from open_clip.loss import SigLipLoss
-    from losses import InfoNCELoss, SPVDLoss
+    from open_clip.loss import ClipLoss, SigLipLoss
+    from losses import SPVDLoss
 
     rank = int(getattr(args, "rank", 0))
     world_size = int(getattr(args, "world_size", 1))
@@ -290,12 +292,11 @@ def create_loss(args: object) -> nn.Module:
             cache_labels=True,
             rank=rank,
             world_size=world_size,
-            decomp_loss_weight=float(getattr(args, "decomp_loss_weight", 0.0)) if bool(getattr(args, "use_route_loss", True)) else 0.0,
-            route_positive_constraint=bool(getattr(args, "route_positive_constraint", True)),
-            route_negative_constraint=bool(getattr(args, "route_negative_constraint", True)),
-            residual_loss_weight=float(getattr(args, "residual_loss_weight", 0.0)),
-            orth_loss_weight=float(getattr(args, "orth_loss_weight", 0.0)),
-            detach_relevance=bool(getattr(args, "detach_relevance", True)),
+            branch_bce_weight=float(getattr(args, "branch_bce_weight", 0.0)),
+            branch_logit_scale=float(getattr(args, "branch_logit_scale", 5.0)),
+            residual_negative_weight=float(getattr(args, "residual_negative_weight", 0.25)),
+            detach_text_for_residual=bool(getattr(args, "detach_text_for_residual", True)),
+            residual_variance_weight=float(getattr(args, "residual_variance_weight", 0.0)),
             residual_variance_gamma=float(getattr(args, "residual_variance_gamma", 1.0)),
             align_weight=float(getattr(args, "align_weight", 1.0)),
             global_align_weight=float(getattr(args, "global_align_weight", 1.0)),
@@ -310,7 +311,7 @@ def create_loss(args: object) -> nn.Module:
             world_size=world_size,
             dist_impl=getattr(args, "loss_dist_impl", None),
         )
-    return InfoNCELoss(
+    return ClipLoss(
         local_loss=bool(getattr(args, "local_loss", True)),
         gather_with_grad=bool(getattr(args, "gather_with_grad", True)),
         cache_labels=True,

@@ -4,16 +4,17 @@ from argparse import Namespace
 
 import torch
 import torch.nn.functional as F
+from open_clip.loss import ClipLoss
 from open_clip.loss import SigLipLoss as OpenCLIPSigLipLoss
 
 from factory import create_loss, create_model_and_transforms
-from losses import InfoNCELoss, SPVDLoss
+from losses import BranchBCELoss, GateMapStats, ResidualVarianceLoss, SPVDLoss
 
 
 def test_clip_loss_returns_scalar() -> None:
     args = Namespace(siglip=False, local_loss=True, gather_with_grad=True, rank=0, world_size=1)
     loss_fn = create_loss(args)
-    assert isinstance(loss_fn, InfoNCELoss)
+    assert isinstance(loss_fn, ClipLoss)
     image = F.normalize(torch.randn(4, 8), dim=-1)
     text = F.normalize(torch.randn(4, 8), dim=-1)
     loss = loss_fn(image, text, torch.tensor(10.0))
@@ -70,10 +71,6 @@ def test_spvd_loss_without_decomposition_uses_alignment_only() -> None:
         gather_with_grad=True,
         rank=0,
         world_size=1,
-        decomp_loss_weight=0.1,
-        residual_loss_weight=0.05,
-        orth_loss_weight=0.01,
-        detach_relevance=True,
         residual_variance_gamma=1.0,
     )
     loss_fn = create_loss(args)
@@ -89,9 +86,8 @@ def test_spvd_loss_without_decomposition_uses_alignment_only() -> None:
     assert loss.ndim == 0
     assert torch.isfinite(loss)
     assert torch.isfinite(loss_dict["loss_align"])
-    assert loss_dict["loss_decomp"].item() == 0.0
-    assert loss_dict["loss_residual"].item() == 0.0
-    assert loss_dict["loss_orth"].item() == 0.0
+    assert loss_dict["loss_branch"].item() == 0.0
+    assert loss_dict["loss_residual_variance"].item() == 0.0
     loss.backward()
     assert outputs["image_features"].grad is not None
     assert outputs["text_features"].grad is not None
@@ -139,37 +135,50 @@ def test_spvd_loss_prefers_flattened_caption_sigmoid_alignment() -> None:
     assert text_features.grad is not None
 
 
-def test_spvd_loss_soft_cue_terms_are_finite() -> None:
+def test_spvd_loss_sigmoid_branch_terms_are_finite() -> None:
     image_features = torch.randn(5, 8, requires_grad=True)
     text_features = torch.randn(5, 8, requires_grad=True)
     residual_features = torch.randn(5, 8, requires_grad=True)
-    routing_logits = torch.randn(5, 4, 6, requires_grad=True)
+    gate_logits = torch.randn(5, 4, 6)
+    sigmoid_map = torch.sigmoid(gate_logits)
     outputs = {
         "image_features": image_features,
         "text_features": text_features,
         "residual_visual_features": residual_features,
-        "routing_logits": routing_logits,
-        "shared_routing": torch.sigmoid(routing_logits),
-        "residual_routing": torch.sigmoid(-routing_logits),
-        "relevance_scores": torch.rand(5, 4, 6),
-        "cue_weights": torch.softmax(torch.randn(5, 4), dim=-1),
+        "gate_logits": gate_logits,
+        "sigmoid_map": sigmoid_map,
+        "residual_map": 1.0 - sigmoid_map,
         "logit_scale": torch.tensor(10.0),
     }
     loss_fn = SPVDLoss(
         rank=0,
         world_size=1,
-        decomp_loss_weight=0.1,
-        residual_loss_weight=0.05,
-        orth_loss_weight=0.01,
+        branch_bce_weight=0.05,
+        residual_variance_weight=0.05,
     )
+    assert isinstance(loss_fn.branch_bce, BranchBCELoss)
+    assert isinstance(loss_fn.residual_variance, ResidualVarianceLoss)
+    assert isinstance(loss_fn.gate_stats, GateMapStats)
 
     loss, loss_dict = loss_fn(outputs)
 
     assert torch.isfinite(loss)
-    for key in ("loss_align", "loss_decomp", "loss_residual", "loss_orth"):
+    for key in (
+        "loss_align",
+        "loss_branch",
+        "loss_branch_s_text",
+        "loss_branch_r_text",
+        "branch_sim_s_text",
+        "branch_sim_r_text",
+        "branch_gap_s_minus_r",
+        "loss_residual_variance",
+        "gate_mean",
+        "gate_std",
+        "gate_min",
+        "gate_max",
+    ):
         assert torch.isfinite(loss_dict[key])
     loss.backward()
     assert image_features.grad is not None
     assert text_features.grad is not None
     assert residual_features.grad is not None
-    assert routing_logits.grad is not None

@@ -252,6 +252,15 @@ def load_flickr30k(dataset_root: Path, split: str, limit_images: int | None) -> 
     return RetrievalDataset("flickr30k", image_paths, image_cues, captions, caption_image_indices, split)
 
 
+
+def _normalize_retrieval_features(features: torch.Tensor) -> torch.Tensor:
+    """Return 2D L2-normalized features before retrieval dot products."""
+    if features.ndim == 3:
+        features = features.mean(dim=1)
+    if features.ndim != 2:
+        raise ValueError(f"Retrieval features must be 2D or 3D, got shape={tuple(features.shape)}.")
+    return torch.nn.functional.normalize(features.float(), dim=-1)
+
 def _open_images(paths: list[Path]) -> list[Image.Image]:
     images: list[Image.Image] = []
     for path in paths:
@@ -277,7 +286,10 @@ def encode_dataset(wrapper: Any, dataset: RetrievalDataset, batch_size: int, log
         if start == 0 or end == len(dataset.captions) or end % max(batch_size * 20, 1) == 0:
             logger.info("%s text features: %d/%d encoded", dataset.name, end, len(dataset.captions))
 
-    return torch.cat(image_features, dim=0).float(), torch.cat(text_features, dim=0).float()
+    return (
+        _normalize_retrieval_features(torch.cat(image_features, dim=0)),
+        _normalize_retrieval_features(torch.cat(text_features, dim=0)),
+    )
 
 
 @torch.inference_mode()
@@ -300,8 +312,8 @@ def encode_dataset_distributed(wrapper: Any, dataset: RetrievalDataset, batch_si
         if ctx.is_rank0 and (start == 0 or start + batch_size >= len(text_indices)):
             logger.info("%s text shard rank=%d encoded %d/%d", dataset.name, ctx.rank, min(start + batch_size, len(text_indices)), len(text_indices))
 
-    local_image_features = torch.cat(image_features, dim=0).float() if image_features else torch.empty(0, 1)
-    local_text_features = torch.cat(text_features, dim=0).float() if text_features else torch.empty(0, 1)
+    local_image_features = _normalize_retrieval_features(torch.cat(image_features, dim=0)) if image_features else torch.empty(0, 1)
+    local_text_features = _normalize_retrieval_features(torch.cat(text_features, dim=0)) if text_features else torch.empty(0, 1)
     all_image_features = _gather_indexed_tensor(image_indices, local_image_features, len(dataset.image_paths), ctx)
     all_text_features = _gather_indexed_tensor(text_indices, local_text_features, len(dataset.captions), ctx)
     _barrier(ctx)
@@ -466,6 +478,8 @@ def compute_retrieval_metrics(
     text_features: torch.Tensor,
     caption_image_indices: list[int],
 ) -> dict[str, float]:
+    image_features = _normalize_retrieval_features(image_features)
+    text_features = _normalize_retrieval_features(text_features)
     similarity = image_features @ text_features.t()
     return compute_retrieval_metrics_from_similarity(similarity, caption_image_indices)
 

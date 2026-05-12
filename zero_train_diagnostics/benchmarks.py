@@ -3,8 +3,12 @@ from __future__ import annotations
 import logging
 import random
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
+from PIL import Image
 
 from .schema import BenchmarkLoadResult, PairwiseSample, WinogroundSample
 from .utils import balanced_limit, clean_text, list_candidate_files, load_records, resolve_existing_path
@@ -101,6 +105,8 @@ def load_aro(dataset_root: Path, limit: int | None, seed: int, config: dict[str,
             root / "vg_attribution" / "images",
             file_path.parent / "images",
             file_path.parent,
+            dataset_root / "vg" / "VG_100K",
+            dataset_root / "vg" / "VG_100K_2",
             dataset_root / "visual_genome" / "VG_100K",
             dataset_root / "visual_genome" / "VG_100K_2",
             Path("/vepfs/dataset/aro/ready/vg/images"),
@@ -159,7 +165,17 @@ def load_aro(dataset_root: Path, limit: int | None, seed: int, config: dict[str,
             continue
         data_files.append(file_path)
         rows = load_records(file_path)
-        image_dirs = [file_path.parent, file_path.parent / "val2014", file_path.parent / "test2014", file_path.parent / "flickr30k-images"]
+        image_dirs = [
+            file_path.parent,
+            file_path.parent / "val2014",
+            file_path.parent / "test2014",
+            file_path.parent / "flickr30k-images",
+            dataset_root / "coco" / "images",
+            dataset_root / "coco" / "images" / "val2014",
+            dataset_root / "coco" / "images" / "test2014",
+            dataset_root / "Flickr30k" / "images",
+            dataset_root / "flickr30k" / "images",
+        ]
         for idx, row in enumerate(rows):
             captions = row.get("caption") or row.get("captions")
             if isinstance(captions, str):
@@ -289,6 +305,179 @@ def load_sugarcrepe(dataset_root: Path, limit: int | None, config: dict[str, Any
     )
 
 
+def load_sugarcrepe_pp(dataset_root: Path, limit: int | None, config: dict[str, Any], logger: logging.Logger | None = None) -> BenchmarkLoadResult:
+    log = _logger(logger)
+    root = Path(config.get("root") or dataset_root / "sugarcrepe_pp")
+    candidates = list_candidate_files(root)
+    warnings: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    samples: list[PairwiseSample] = []
+    if not root.exists():
+        warning = f"SugarCrepe++ root not found: {root}"
+        log.warning(warning)
+        return BenchmarkLoadResult("sugarcrepe_pp", [], "missing", candidates, candidates, [warning], skipped)
+    data_files = [p for p in candidates if p.name in {
+        "replace_att.json",
+        "replace_obj.json",
+        "replace_rel.json",
+        "swap_att.json",
+        "swap_obj.json",
+    }]
+    if not data_files:
+        data_files = [p for p in candidates if p.suffix == ".json"]
+    image_dirs = [
+        root / "coco_val2017_images",
+        dataset_root / "coco" / "images" / "val2017",
+        root / "ready" / "coco2017" / "val2017",
+        root / "coco2017" / "val2017",
+        Path("/vepfs/dataset/sugarcrepe/ready/coco2017/val2017"),
+        root,
+    ]
+    for file_path in sorted(data_files):
+        category = file_path.stem
+        match = re.match(r"(?P<kind>[^_]+)_(?P<sub>.+)", category)
+        subcategory = match.group("sub") if match else None
+        rows = load_records(file_path)
+        for idx, row in enumerate(rows):
+            sample_id = str(row.get("sample_id") or row.get("id") or idx)
+            image_ref = row.get("filename") or row.get("image") or row.get("image_path")
+            pos_1 = row.get("caption") or row.get("positive_caption") or row.get("true_caption")
+            pos_2 = row.get("caption2") or row.get("positive_caption_2")
+            neg = row.get("negative_caption") or row.get("false_caption")
+            if not image_ref or not pos_1 or not neg:
+                skipped.append(_skip("sugarcrepe_pp", file_path, sample_id, "missing image or caption fields"))
+                continue
+            image_path = resolve_existing_path(str(image_ref), image_dirs)
+            if image_path is None:
+                skipped.append(_skip("sugarcrepe_pp", file_path, sample_id, f"image not found: {image_ref}"))
+                continue
+            positives = [("caption", pos_1)]
+            if pos_2:
+                positives.append(("caption2", pos_2))
+            for variant, pos in positives:
+                samples.append(
+                    PairwiseSample(
+                        benchmark="sugarcrepe_pp",
+                        sample_id=f"{category}_{sample_id}_{variant}",
+                        image_path=image_path,
+                        positive_caption=clean_text(pos),
+                        negative_captions=[clean_text(neg)],
+                        category=category,
+                        subcategory=subcategory,
+                        source_file=file_path,
+                        image_id=str(image_ref),
+                        negative_types=["hard_negative"],
+                        metadata={
+                            **{k: v for k, v in row.items() if k not in {"caption", "caption2", "negative_caption"}},
+                            "positive_variant": variant,
+                        },
+                    )
+                )
+    limited = balanced_limit(samples, limit, key_fn=lambda item: item.category)
+    log.info("SugarCrepe++ candidates: %s", [str(p) for p in candidates])
+    log.info("SugarCrepe++ selected data files: %s", [str(p) for p in data_files])
+    log.info("SugarCrepe++ loaded %d pairwise samples (%d after limit)", len(samples), len(limited))
+    return BenchmarkLoadResult(
+        "sugarcrepe_pp",
+        limited,
+        "ok" if limited else "empty",
+        data_files=data_files,
+        candidates=candidates,
+        warnings=warnings,
+        skipped_samples=skipped,
+        metadata={"loaded_sample_count": len(samples), "positive_variants": ["caption", "caption2"]},
+    )
+
+
+def _image_bytes_from_cell(cell: Any) -> bytes | None:
+    if isinstance(cell, (bytes, bytearray)):
+        return bytes(cell)
+    if isinstance(cell, dict):
+        value = cell.get("bytes") or cell.get("data")
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+    return None
+
+
+def _materialize_bivlc_image(cell: Any, path: Path) -> Path | None:
+    image_bytes = _image_bytes_from_cell(cell)
+    if image_bytes is None:
+        return None
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.convert("RGB").save(path, format="JPEG", quality=95)
+    return path
+
+
+def load_bivlc(dataset_root: Path, limit: int | None, config: dict[str, Any], logger: logging.Logger | None = None) -> BenchmarkLoadResult:
+    log = _logger(logger)
+    root = Path(config.get("root") or dataset_root / "bivlc")
+    candidates = list_candidate_files(root, exts=(".json", ".jsonl", ".csv", ".tsv", ".parquet"))
+    warnings: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    samples: list[WinogroundSample] = []
+    if not root.exists():
+        warning = f"BiVLC root not found: {root}"
+        log.warning(warning)
+        return BenchmarkLoadResult("bivlc", [], "missing", candidates, candidates, [warning], skipped)
+    data_files = [p for p in candidates if p.suffix == ".parquet"]
+    if not data_files:
+        warning = f"BiVLC parquet files not found under {root}"
+        log.warning(warning)
+        return BenchmarkLoadResult("bivlc", [], "missing", [], candidates, [warning], skipped)
+    image_root = Path(config.get("image_root") or root / "images_or_links" / "extracted")
+    for file_path in sorted(data_files):
+        frame = pd.read_parquet(file_path)
+        for idx, row in frame.iterrows():
+            sample_id = f"{file_path.stem}_{idx}"
+            caption = row.get("caption")
+            negative_caption = row.get("negative_caption")
+            if not caption or not negative_caption:
+                skipped.append(_skip("bivlc", file_path, sample_id, "missing caption fields"))
+                continue
+            pos_path = image_root / file_path.stem / f"{idx:06d}_pos.jpg"
+            neg_path = image_root / file_path.stem / f"{idx:06d}_neg.jpg"
+            try:
+                pos_image = _materialize_bivlc_image(row.get("image"), pos_path)
+                neg_image = _materialize_bivlc_image(row.get("negative_image"), neg_path)
+            except Exception as exc:
+                skipped.append(_skip("bivlc", file_path, sample_id, f"image materialization failed: {exc!r}"))
+                continue
+            if pos_image is None or neg_image is None:
+                skipped.append(_skip("bivlc", file_path, sample_id, "missing image bytes"))
+                continue
+            category = str(row.get("type") or "")
+            subcategory = str(row.get("subtype") or "")
+            samples.append(
+                WinogroundSample(
+                    benchmark="bivlc",
+                    sample_id=sample_id,
+                    image_0_path=pos_image,
+                    image_1_path=neg_image,
+                    caption_0=clean_text(caption),
+                    caption_1=clean_text(negative_caption),
+                    category=category,
+                    source_file=file_path,
+                    metadata={"type": category, "subtype": subcategory},
+                )
+            )
+    limited = balanced_limit(samples, limit, key_fn=lambda item: str(item.category))
+    log.info("BiVLC candidates: %s", [str(p) for p in candidates])
+    log.info("BiVLC selected data files: %s", [str(p) for p in data_files])
+    log.info("BiVLC loaded %d 2x2 samples (%d after limit)", len(samples), len(limited))
+    return BenchmarkLoadResult(
+        "bivlc",
+        limited,
+        "ok" if limited else "empty",
+        data_files=data_files,
+        candidates=candidates,
+        warnings=warnings,
+        skipped_samples=skipped,
+        metadata={"loaded_sample_count": len(samples), "retrieval_instances_per_sample": 4, "image_root": str(image_root)},
+    )
+
+
 def load_winoground(dataset_root: Path, limit: int | None, config: dict[str, Any], logger: logging.Logger | None = None) -> BenchmarkLoadResult:
     log = _logger(logger)
     root = Path(config.get("root") or dataset_root / "winoground")
@@ -384,6 +573,10 @@ def load_benchmarks(dataset_root: Path, limit: int | None, config: dict[str, Any
         results["aro"] = load_aro(dataset_root, limit, seed, benchmark_cfg.get("aro") or {}, logger)
     if "sugarcrepe" in enabled:
         results["sugarcrepe"] = load_sugarcrepe(dataset_root, limit, benchmark_cfg.get("sugarcrepe") or {}, logger)
+    if "sugarcrepe_pp" in enabled:
+        results["sugarcrepe_pp"] = load_sugarcrepe_pp(dataset_root, limit, benchmark_cfg.get("sugarcrepe_pp") or {}, logger)
+    if "bivlc" in enabled:
+        results["bivlc"] = load_bivlc(dataset_root, limit, benchmark_cfg.get("bivlc") or {}, logger)
     if "winoground" in enabled:
         results["winoground"] = load_winoground(dataset_root, limit, benchmark_cfg.get("winoground") or {}, logger)
     return results

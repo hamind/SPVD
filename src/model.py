@@ -367,131 +367,85 @@ class SoftCueExtractor(nn.Module):
         return self.out_norm(slots)
 
 
-class SoftCueVisualRouter(nn.Module):
-    """Predict shared routing logits with normalized cue-image similarity."""
-
-    def __init__(self, embed_dim: int, hidden_dim: Optional[int] = None) -> None:
-        super().__init__()
-        router_dim = int(hidden_dim or embed_dim)
-        self.q_proj = nn.Linear(embed_dim, router_dim)
-        self.v_proj = nn.Linear(embed_dim, router_dim)
-
-    def forward(self, q: Tensor, v: Tensor) -> Tensor:
-        """Return routing similarity logits [B, S, M] or [B, K, S, M].
-
-        Positive logits indicate stronger shared routing.
-        Negative logits indicate stronger residual/private routing.
-        """
-        q = F.normalize(self.q_proj(q), dim=-1)
-        v = F.normalize(self.v_proj(v), dim=-1)
-
-        if q.ndim == 3:
-            similarity = torch.einsum("bsd,bmd->bsm", q, v)
-        elif q.ndim == 4:
-            similarity = torch.einsum("bksd,bmd->bksm", q, v)
-        else:
-            raise ValueError("q must have shape [B, S, D] or [B, K, S, D].")
-
-        return similarity
-
-
-class SoftCueBidirectionalDecomposition(nn.Module):
-    """Condition visual shared/residual decomposition on language soft cues."""
+class SoftCueSigmoidDecomposition(nn.Module):
+    """Text-conditioned visual decomposition with sigmoid-gated token pooling."""
 
     def __init__(
         self,
         visual_dim: int,
         embed_dim: int,
-        relevance_temperature: float = 1.0,
-        routing_temperature: float = 1.0,
+        gate_temperature: float = 1.0,
+        gate_bias_init: float = 0.0,
         eps: float = 1.0e-6,
     ) -> None:
         super().__init__()
-        if relevance_temperature <= 0:
-            raise ValueError("relevance_temperature must be positive.")
-        if routing_temperature <= 0:
-            raise ValueError("routing_temperature must be positive.")
+        if gate_temperature <= 0:
+            raise ValueError("gate_temperature must be positive.")
         self.visual_dim = int(visual_dim)
         self.embed_dim = int(embed_dim)
-        self.relevance_temperature = float(relevance_temperature)
-        self.routing_temperature = float(routing_temperature)
+        self.gate_temperature = float(gate_temperature)
         self.eps = float(eps)
-        self.visual_proj_for_relevance = nn.Linear(self.visual_dim, self.embed_dim)
-        self.cue_proj_for_relevance = nn.Linear(self.embed_dim, self.embed_dim)
-        self.router = SoftCueVisualRouter(self.embed_dim)
-        self.shared_out_proj = nn.Linear(self.visual_dim, self.embed_dim)
-        self.residual_out_proj = nn.Linear(self.visual_dim, self.embed_dim)
-        self.cue_weight_head = nn.Linear(self.embed_dim, 1)
-
-    def _aggregate_caption_features(self, caption_features: Tensor) -> Tensor:
-        if caption_features.ndim == 2:
-            return caption_features
-        return F.normalize(caption_features.mean(dim=1), dim=-1)
+        self.query_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.key_proj = nn.Linear(self.visual_dim, self.embed_dim)
+        self.semantic_value_proj = nn.Linear(self.visual_dim, self.embed_dim)
+        self.residual_value_proj = nn.Linear(self.visual_dim, self.embed_dim)
+        self.gate_bias = nn.Parameter(torch.tensor(float(gate_bias_init)))
+        self.out_semantic_norm = nn.LayerNorm(self.embed_dim)
+        self.out_residual_norm = nn.LayerNorm(self.embed_dim)
+        self.out_semantic_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_residual_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
     def forward(self, visual_tokens: Tensor, soft_cues: Tensor) -> dict[str, Tensor]:
         """Decompose visual tokens [B, M, D_v] using cues [B, S, D] or [B, K, S, D]."""
         if soft_cues.ndim not in {3, 4}:
             raise ValueError("soft_cues must have shape [B, S, D] or [B, K, S, D].")
-        visual_tokens = visual_tokens.to(dtype=self.visual_proj_for_relevance.weight.dtype)
-        soft_cues = soft_cues.to(device=visual_tokens.device, dtype=self.cue_proj_for_relevance.weight.dtype)
+        single_caption = soft_cues.ndim == 3
+        if single_caption:
+            soft_cues = soft_cues.unsqueeze(1)
 
-        q_proj = self.cue_proj_for_relevance(soft_cues)
-        v_proj = self.visual_proj_for_relevance(visual_tokens)
-        if soft_cues.ndim == 3:
-            relevance_logits = torch.einsum("bsd,bmd->bsm", q_proj, v_proj) / math.sqrt(float(self.embed_dim))
-            image_attention = torch.softmax(relevance_logits / self.relevance_temperature, dim=-1)
-            cue_attended = torch.einsum("bsm,bmd->bsd", image_attention, visual_tokens)
-            cue_weights = torch.softmax(self.cue_weight_head(soft_cues).squeeze(-1), dim=1)
-            cue_feature_expr = "bs,bsd->bd"
-        else:
-            relevance_logits = torch.einsum("bksd,bmd->bksm", q_proj, v_proj) / math.sqrt(float(self.embed_dim))
-            image_attention = torch.softmax(relevance_logits / self.relevance_temperature, dim=-1)
-            cue_attended = torch.einsum("bksm,bmd->bksd", image_attention, visual_tokens)
-            cue_weights = torch.softmax(self.cue_weight_head(soft_cues).squeeze(-1), dim=2)
-            cue_feature_expr = "bks,bksd->bkd"
+        visual_tokens = visual_tokens.to(dtype=self.key_proj.weight.dtype)
+        soft_cues = soft_cues.to(device=visual_tokens.device, dtype=self.query_proj.weight.dtype)
 
-        relevance_scores = torch.sigmoid(relevance_logits / self.relevance_temperature)
+        queries = self.query_proj(soft_cues)
+        keys = self.key_proj(visual_tokens)
+        semantic_values = self.semantic_value_proj(visual_tokens)
+        residual_values = self.residual_value_proj(visual_tokens)
+        scale = math.sqrt(float(self.embed_dim))
 
-        raw_routing_logits = self.router(q_proj, v_proj)
-        routing_logits = raw_routing_logits / self.routing_temperature
+        similarities = torch.einsum("bksd,bnd->bksn", queries, keys) / scale
+        gate_logits = (similarities + self.gate_bias.to(dtype=similarities.dtype)) / self.gate_temperature
 
-        shared_routing = torch.sigmoid(routing_logits)
-        residual_routing = torch.sigmoid(-routing_logits)
+        sigmoid_map = torch.sigmoid(gate_logits)
+        residual_map = 1.0 - sigmoid_map
 
-        routing_probs = torch.stack((shared_routing, residual_routing), dim=-1)
-        routing_pair_logits = torch.stack((routing_logits, -routing_logits), dim=-1)
+        semantic_den = sigmoid_map.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+        residual_den = residual_map.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
-        den_r = residual_routing.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        if soft_cues.ndim == 3:
-            cue_residual = torch.einsum("bsm,bmd->bsd", residual_routing, visual_tokens) / den_r
-        else:
-            cue_residual = torch.einsum("bksm,bmd->bksd", residual_routing, visual_tokens) / den_r
+        cue_semantic = torch.einsum("bksn,bnd->bksd", sigmoid_map, semantic_values) / semantic_den
+        cue_residual = torch.einsum("bksn,bnd->bksd", residual_map, residual_values) / residual_den
 
-        cue_visual_features = F.normalize(self.shared_out_proj(cue_attended), dim=-1)
-        cue_residual_features = F.normalize(self.residual_out_proj(cue_residual), dim=-1)
-        caption_shared_features = F.normalize(torch.einsum(cue_feature_expr, cue_weights, cue_visual_features), dim=-1)
-        caption_residual_features = F.normalize(torch.einsum(cue_feature_expr, cue_weights, cue_residual_features), dim=-1)
-        shared_visual_features = self._aggregate_caption_features(caption_shared_features)
-        residual_visual_features = self._aggregate_caption_features(caption_residual_features)
+        semantic_features = cue_semantic.mean(dim=2)
+        residual_features = cue_residual.mean(dim=2)
 
-        outputs = {
-            "shared_visual_features": shared_visual_features,
-            "residual_visual_features": residual_visual_features,
-            "cue_visual_features": cue_visual_features,
-            "cue_residual_features": cue_residual_features,
-            "relevance_scores": relevance_scores,
-            "image_attention": image_attention,
-            "routing_logits": routing_logits,
-            "shared_routing": shared_routing,
-            "residual_routing": residual_routing,
-            "routing_probs": routing_probs,
-            "routing_pair_logits": routing_pair_logits,
-            "cue_weights": cue_weights,
+        semantic_features = self.out_semantic_proj(self.out_semantic_norm(semantic_features))
+        residual_features = self.out_residual_proj(self.out_residual_norm(residual_features))
+
+        if single_caption:
+            cue_semantic = cue_semantic.squeeze(1)
+            cue_residual = cue_residual.squeeze(1)
+            semantic_features = semantic_features.squeeze(1)
+            residual_features = residual_features.squeeze(1)
+            sigmoid_map = sigmoid_map.squeeze(1)
+            residual_map = residual_map.squeeze(1)
+            gate_logits = gate_logits.squeeze(1)
+
+        return {
+            "semantic_features": semantic_features,
+            "residual_features": residual_features,
+            "sigmoid_map": sigmoid_map,
+            "residual_map": residual_map,
+            "gate_logits": gate_logits,
         }
-        if soft_cues.ndim == 4:
-            outputs["caption_shared_visual_features"] = caption_shared_features
-            outputs["caption_residual_visual_features"] = caption_residual_features
-        return outputs
 
 
 class SPVDModel(nn.Module):
@@ -563,11 +517,11 @@ class SPVDModel(nn.Module):
                     num_layers=int(cfg.get("soft_cue_num_layers", 1)),
                     dropout=float(cfg.get("soft_cue_dropout", 0.0)),
                 )
-            self.soft_cue_decomposition = SoftCueBidirectionalDecomposition(
+            self.soft_cue_decomposition = SoftCueSigmoidDecomposition(
                 visual_dim=self.visual_dim,
                 embed_dim=self.embed_dim,
-                relevance_temperature=float(cfg.get("relevance_temperature", 1.0)),
-                routing_temperature=float(cfg.get("routing_temperature", 1.0)),
+                gate_temperature=float(cfg.get("gate_temperature", cfg.get("routing_temperature", 1.0))),
+                gate_bias_init=float(cfg.get("gate_bias_init", 0.0)),
             )
 
     def _freeze_unused_visual_projection(self) -> None:
@@ -785,36 +739,18 @@ class SPVDModel(nn.Module):
             text_features = text_global
 
         decomp_outputs = self.soft_cue_decomposition(image_tokens, soft_cues)
-        shared_global = decomp_outputs["shared_visual_features"]
-        residual_global = decomp_outputs["residual_visual_features"]
+        shared_global = decomp_outputs["semantic_features"]
+        residual_global = decomp_outputs["residual_features"]
         outputs = {
             "image_features": shared_global,
             "text_features": text_features,
             "logit_scale": self.logit_scale.exp(),
-            "z_v_s": shared_global,
-            "z_v_p": residual_global,
-            "z_t": text_features,
             "shared_visual_features": shared_global,
             "residual_visual_features": residual_global,
-            "cue_visual_features": decomp_outputs["cue_visual_features"],
-            "cue_residual_features": decomp_outputs["cue_residual_features"],
-            "cue": soft_cues,
-            "soft_cues": soft_cues,
-            "relevance_scores": decomp_outputs["relevance_scores"],
-            "routing_logits": decomp_outputs["routing_logits"],
-            "shared_routing": decomp_outputs["shared_routing"],
-            "residual_routing": decomp_outputs["residual_routing"],
-            "routing_probs": decomp_outputs["routing_probs"],
-            "routing_pair_logits": decomp_outputs["routing_pair_logits"],
-            "cue_weights": decomp_outputs["cue_weights"],
-            "image_attention": decomp_outputs["image_attention"],
-            "image_tokens": image_tokens if self.return_patch_tokens else None,
-            "text_tokens": text_tokens,
-            "text_global": text_global,
             "caption_text_features": caption_text_features,
-            "caption_shared_visual_features": decomp_outputs.get("caption_shared_visual_features"),
-            "caption_residual_visual_features": decomp_outputs.get("caption_residual_visual_features"),
-            "image_global": image_global,
+            "sigmoid_map": decomp_outputs["sigmoid_map"],
+            "residual_map": decomp_outputs["residual_map"],
+            "gate_logits": decomp_outputs["gate_logits"],
         }
         if self.logit_bias is not None:
             outputs["logit_bias"] = self.logit_bias

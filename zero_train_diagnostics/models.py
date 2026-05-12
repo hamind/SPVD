@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
@@ -24,6 +25,14 @@ def _read_checkpoint_state_dict(checkpoint_path: Path, weights_only: bool) -> di
             checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=weights_only)
         except TypeError:
             checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+        except Exception:
+            if not weights_only:
+                raise
+            logging.getLogger(__name__).warning(
+                "weights_only checkpoint load failed for %s; falling back to weights_only=False for local trusted checkpoint",
+                checkpoint_path,
+            )
+            checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict):
         for key in ("state_dict", "model", "model_state_dict", "module"):
@@ -292,6 +301,148 @@ class OpenClipWrapper(FrozenVLMWrapper):
         return True
 
 
+class _FlairLinearPost(nn.Module):
+    def __init__(self, projection: torch.Tensor) -> None:
+        super().__init__()
+        self.proj = nn.Parameter(projection.detach().clone())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.proj
+
+
+class _FlairTextConditionedPool(nn.Module):
+    def __init__(self, embed_dim: int = 512, num_heads: int = 8) -> None:
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        self.ln_q = nn.LayerNorm(embed_dim)
+        self.ln_k = nn.LayerNorm(embed_dim)
+        self.ln_v = nn.LayerNorm(embed_dim)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+        pooled, _ = self.attn(self.ln_q(query), self.ln_k(key), self.ln_v(value), need_weights=False)
+        return pooled
+
+
+class FLAIRWrapper(FrozenVLMWrapper):
+    """FLAIR scoring with text-conditioned attention pooling, not global CLIP matching."""
+
+    def __init__(
+        self,
+        name: str,
+        model_name: str,
+        checkpoint_path: Path,
+        device: str,
+        dtype: str = "fp32",
+        force_quick_gelu: bool = False,
+    ) -> None:
+        super().__init__(name=name, model_type="flair", device=device, dtype=dtype)
+        import open_clip
+        from open_clip.transformer import text_global_pool
+
+        model, _, preprocess_val = open_clip.create_model_and_transforms(
+            model_name,
+            pretrained="",
+            device=self.device,
+            force_quick_gelu=force_quick_gelu,
+            output_dict=True,
+        )
+        state_dict = _read_checkpoint_state_dict(Path(checkpoint_path), weights_only=False)
+        target_state = model.state_dict()
+        filtered_state: dict[str, torch.Tensor] = {}
+        skipped: list[str] = []
+        for key, value in state_dict.items():
+            if key.startswith(("visual_proj.", "image_post.", "text_post.")) or key == "logit_bias":
+                continue
+            target_value = target_state.get(key)
+            if target_value is None or tuple(target_value.shape) != tuple(value.shape):
+                skipped.append(key)
+                continue
+            filtered_state[key] = value
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+
+        image_proj = state_dict.get("image_post.proj")
+        text_proj = state_dict.get("text_post.proj")
+        if image_proj is None or text_proj is None:
+            raise KeyError(f"FLAIR checkpoint {checkpoint_path} is missing image_post.proj or text_post.proj")
+        attention_state = {
+            key[len("visual_proj.") :]: value
+            for key, value in state_dict.items()
+            if key.startswith("visual_proj.")
+        }
+        if not attention_state:
+            raise KeyError(f"FLAIR checkpoint {checkpoint_path} is missing visual_proj attention pooling weights")
+
+        self.image_post = _FlairLinearPost(image_proj).to(self.device).eval()
+        self.text_post = _FlairLinearPost(text_proj).to(self.device).eval()
+        self.visual_proj = _FlairTextConditionedPool(embed_dim=int(text_proj.shape[-1]), num_heads=8).to(self.device).eval()
+        pool_missing, pool_unexpected = self.visual_proj.load_state_dict(attention_state, strict=False)
+        if pool_missing or pool_unexpected:
+            logging.getLogger(__name__).warning(
+                "Loaded FLAIR visual_proj with missing=%s unexpected=%s",
+                list(pool_missing),
+                list(pool_unexpected),
+            )
+
+        self.model = model.eval()
+        self.preprocess = preprocess_val
+        self.tokenizer = open_clip.get_tokenizer(model_name)
+        self._text_global_pool = text_global_pool
+        self.logit_bias = state_dict.get("logit_bias", torch.zeros((), dtype=torch.float32)).detach().to(self.device)
+        logging.getLogger(__name__).warning(
+            "Loaded FLAIR %s: encoder_kept=%d encoder_skipped=%d missing=%d unexpected=%d",
+            checkpoint_path,
+            len(filtered_state),
+            len(skipped),
+            len(missing),
+            len(unexpected),
+        )
+
+    def parameter_count(self) -> int:
+        base = super().parameter_count()
+        extras = sum(p.numel() for module in (self.image_post, self.text_post, self.visual_proj) for p in module.parameters())
+        return base + extras
+
+    def _encode_image_raw(self, image_tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.model is not None
+        visual = self.model.visual
+        x = visual._embeds(image_tensor)
+        x = visual.transformer(x)
+        pooled, tokens = visual._pool(x)
+        return pooled, tokens
+
+    def _encode_text_raw(self, text_tokens: torch.Tensor) -> torch.Tensor:
+        assert self.model is not None
+        cast_dtype = self.model.transformer.get_cast_dtype()
+        x = self.model.token_embedding(text_tokens).to(cast_dtype)
+        x = x + self.model.positional_embedding.to(cast_dtype)
+        x = self.model.transformer(x, attn_mask=self.model.attn_mask)
+        x = self.model.ln_final(x)
+        return self._text_global_pool(
+            x,
+            text_tokens,
+            self.model.text_pool_type,
+            eos_token_id=getattr(self.model, "text_eos_id", None),
+        )
+
+    @torch.inference_mode()
+    def score_pairs(self, images: list[Image.Image], texts: list[str]) -> torch.Tensor:
+        assert self.model is not None
+        image_tensor = self._image_tensor(images)
+        text_tokens = self._text_tokens(texts)
+        with self._autocast_context():
+            _, local_image_tokens = self._encode_image_raw(image_tensor)
+            global_text_tokens = self._encode_text_raw(text_tokens)
+            local_image_features = self.image_post(local_image_tokens)
+            text_features = self.text_post(global_text_tokens)
+            query = text_features.unsqueeze(1)
+            conditioned_image_features = self.visual_proj(query, local_image_features, local_image_features).squeeze(1)
+            image_features = F.normalize(conditioned_image_features.float(), dim=-1)
+            text_features = F.normalize(text_features.float(), dim=-1)
+            scores = self.model.logit_scale.exp().float() * (image_features * text_features).sum(dim=-1)
+            scores = scores + self.logit_bias.float()
+        return scores.detach().cpu()
+
+
 class HFCLIPWrapper(FrozenVLMWrapper):
     def __init__(self, name: str, local_dir: Path, device: str, dtype: str = "fp32") -> None:
         super().__init__(name=name, model_type="hf_clip", device=device, dtype=dtype)
@@ -508,7 +659,9 @@ class SPVDWrapper(FrozenVLMWrapper):
         with self._autocast_context():
             decomp_outputs = self.model.soft_cue_decomposition(image_tokens, soft_cues)
             shared_features = decomp_outputs["shared_visual_features"]
-        scores = (shared_features.float() * text_features.float()).sum(dim=-1)
+        shared_features = F.normalize(shared_features.float(), dim=-1)
+        text_features = F.normalize(text_features.float(), dim=-1)
+        scores = (shared_features * text_features).sum(dim=-1)
         return scores
 
     @torch.inference_mode()
@@ -604,6 +757,17 @@ def load_model(model_cfg: dict[str, Any], model_root: Path, device: str, dtype: 
                 device=device,
                 dtype=dtype,
                 force_quick_gelu=bool(model_cfg.get("force_quick_gelu", model_cfg.get("pretrained") == "openai")),
+            )
+        elif model_type == "flair":
+            if checkpoint is None:
+                raise FileNotFoundError(f"no local FLAIR checkpoint found for {name} under {model_root}")
+            wrapper = FLAIRWrapper(
+                name=name,
+                model_name=str(model_cfg.get("model_name") or "ViT-B-16"),
+                checkpoint_path=checkpoint,
+                device=device,
+                dtype=dtype,
+                force_quick_gelu=bool(model_cfg.get("force_quick_gelu", False)),
             )
         elif model_type in {"hf_clip", "clip", "transformers_clip"}:
             if model_dir is None:

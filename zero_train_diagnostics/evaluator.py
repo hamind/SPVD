@@ -24,7 +24,9 @@ from PIL import Image
 from .benchmarks import load_benchmarks
 from .metrics import (
     summarize_aro,
+    summarize_2x2_by_benchmark,
     summarize_margins,
+    summarize_pairwise_by_benchmark,
     summarize_ssr,
     summarize_sugarcrepe,
     summarize_winoground,
@@ -1321,13 +1323,14 @@ def _evaluate_winoground_with_text_conditioned_cache(
     pipeline_cfg: PipelineConfig | None = None,
 ) -> pd.DataFrame:
     dist_ctx = dist_ctx or DistributedEvalContext()
+    benchmark_name = benchmark.name
     all_samples = [sample for sample in benchmark.samples if isinstance(sample, WinogroundSample)]
     samples = _shard_list(all_samples, dist_ctx)
-    raw_path = _rank_jsonl_path(run_dir, model.name, "winoground", dist_ctx.rank) if dist_ctx.use_shards else _merged_csv_path(run_dir, model.name, "winoground")
+    raw_path = _rank_jsonl_path(run_dir, model.name, benchmark_name, dist_ctx.rank) if dist_ctx.use_shards else _merged_csv_path(run_dir, model.name, benchmark_name)
     if raw_path.exists():
         raw_path.unlink()
     if dist_ctx.use_shards and dist_ctx.is_rank0:
-        merged_path = _merged_csv_path(run_dir, model.name, "winoground")
+        merged_path = _merged_csv_path(run_dir, model.name, benchmark_name)
         if merged_path.exists():
             merged_path.unlink()
 
@@ -1344,9 +1347,10 @@ def _evaluate_winoground_with_text_conditioned_cache(
         )
     )
     logger.info(
-        "SPVD exact_cached %splan for %s/winoground rank=%d/%d: total_samples=%d shard_samples=%d unique_images=%d unique_texts=%d pair_count=%d workers=%d pair_chunk_size=%d cache_dtype=%s",
+        "SPVD exact_cached %splan for %s/%s rank=%d/%d: total_samples=%d shard_samples=%d unique_images=%d unique_texts=%d pair_count=%d workers=%d pair_chunk_size=%d cache_dtype=%s",
         "dry-run " if dry_run else "",
         model.name,
+        benchmark_name,
         dist_ctx.rank,
         dist_ctx.world_size,
         len(all_samples),
@@ -1362,7 +1366,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
     image_cache = ImageCache(max_items=64)
     image_tokens, bad_image_keys = _cache_image_tokens(
         model,
-        "winoground",
+        benchmark_name,
         image_keys,
         image_cache,
         batch_size,
@@ -1370,12 +1374,13 @@ def _evaluate_winoground_with_text_conditioned_cache(
         skipped_samples,
         pipeline_cfg,
     )
-    text_cache = _cache_text_cues(model, "winoground", unique_texts, batch_size, logger, pipeline_cfg)
+    text_cache = _cache_text_cues(model, benchmark_name, unique_texts, batch_size, logger, pipeline_cfg)
     image_cache_bytes = _tensor_tree_nbytes(image_tokens)
     text_cache_bytes = _tensor_tree_nbytes(text_cache)
     logger.info(
-        "SPVD exact_cached cache memory for %s/winoground: image_tokens=%s text_cues=%s total=%s",
+        "SPVD exact_cached cache memory for %s/%s: image_tokens=%s text_cues=%s total=%s",
         model.name,
+        benchmark_name,
         _format_bytes(image_cache_bytes),
         _format_bytes(text_cache_bytes),
         _format_bytes(image_cache_bytes + text_cache_bytes),
@@ -1399,7 +1404,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
             if key_0 in bad_image_keys or key_1 in bad_image_keys or key_0 not in image_tokens or key_1 not in image_tokens:
                 skipped_samples.append(
                     {
-                        "benchmark": "winoground",
+                        "benchmark": benchmark_name,
                         "source_file": str(sample.source_file) if sample.source_file else "",
                         "sample_id": sample.sample_id,
                         "reason": "image token cache unavailable",
@@ -1409,7 +1414,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
             if text_0 is None or text_1 is None:
                 skipped_samples.append(
                     {
-                        "benchmark": "winoground",
+                        "benchmark": benchmark_name,
                         "source_file": str(sample.source_file) if sample.source_file else "",
                         "sample_id": sample.sample_id,
                         "reason": "text cue cache unavailable",
@@ -1438,7 +1443,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
                 pipeline_cfg,
                 logger,
                 run_dir,
-                "winoground",
+                benchmark_name,
                 dist_ctx,
                 start // max(1, sample_chunk),
             )
@@ -1473,7 +1478,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
                 {
                     "model_name": model.name,
                     "model_type": model.model_type,
-                    "benchmark": "winoground",
+                    "benchmark": benchmark_name,
                     "sample_id": sample.sample_id,
                     "category": sample.category,
                     "image_0_path": str(sample.image_0_path),
@@ -1498,8 +1503,9 @@ def _evaluate_winoground_with_text_conditioned_cache(
         if start == 0 or start + sample_chunk >= len(samples) or (start + sample_chunk) % (sample_chunk * 10) == 0:
             throughput = len(score_values) / max(timing["gpu_time"], 1e-9) if pipeline_cfg is not None else 0.0
             logger.info(
-                "%s/winoground rank=%d raw rows scored: %d/%d data=%.4fs h2d=%.4fs gpu=%.4fs throughput=%.2f pairs/s",
+                "%s/%s rank=%d raw rows scored: %d/%d data=%.4fs h2d=%.4fs gpu=%.4fs throughput=%.2f pairs/s",
                 model.name,
+                benchmark_name,
                 dist_ctx.rank,
                 min(start + sample_chunk, len(samples)),
                 len(samples),
@@ -1519,8 +1525,9 @@ def _evaluate_winoground_with_text_conditioned_cache(
     global_text, global_image, global_group, global_total = _dist_all_reduce_sum([local_text, local_image, local_group, local_total], dist_ctx)
     if dist_ctx.is_rank0:
         logger.info(
-            "%s/winoground metric aggregate: text=%d image=%d group=%d total=%d",
+            "%s/%s metric aggregate: text=%d image=%d group=%d total=%d",
             model.name,
+            benchmark_name,
             int(global_text),
             int(global_image),
             int(global_group),
@@ -1528,7 +1535,7 @@ def _evaluate_winoground_with_text_conditioned_cache(
         )
     logger.info("Wrote %d raw rows to %s", len(rows), raw_path)
     if dist_ctx.use_shards:
-        return _merge_rank_jsonl(run_dir, model.name, "winoground", dist_ctx)
+        return _merge_rank_jsonl(run_dir, model.name, benchmark_name, dist_ctx)
     return pd.DataFrame(rows)
 
 
@@ -1546,6 +1553,7 @@ def evaluate_winoground(
     pipeline_cfg: PipelineConfig | None = None,
 ) -> pd.DataFrame:
     dist_ctx = dist_ctx or DistributedEvalContext()
+    benchmark_name = benchmark.name
     eval_mode = eval_mode or {}
     spvd_pairwise_mode = str(eval_mode.get("spvd_pairwise_mode", "exact_cached"))
     if model.supports_text_conditioned_pair_cache and spvd_pairwise_mode == "exact_cached":
@@ -1562,17 +1570,18 @@ def evaluate_winoground(
             pipeline_cfg,
         )
     samples_for_rank = _shard_list(list(benchmark.samples), dist_ctx) if dist_ctx.use_shards else list(benchmark.samples)
-    raw_path = _rank_jsonl_path(run_dir, model.name, "winoground", dist_ctx.rank) if dist_ctx.use_shards else _merged_csv_path(run_dir, model.name, "winoground")
+    raw_path = _rank_jsonl_path(run_dir, model.name, benchmark_name, dist_ctx.rank) if dist_ctx.use_shards else _merged_csv_path(run_dir, model.name, benchmark_name)
     if raw_path.exists():
         raw_path.unlink()
     if dist_ctx.use_shards and dist_ctx.is_rank0:
-        merged_path = _merged_csv_path(run_dir, model.name, "winoground")
+        merged_path = _merged_csv_path(run_dir, model.name, benchmark_name)
         if merged_path.exists():
             merged_path.unlink()
         total = len(benchmark.samples)
         logger.info(
-            "%s/winoground distributed naive path: total_samples=%d per_rank=%s num_workers=%d pair_chunk_size=%d",
+            "%s/%s distributed naive path: total_samples=%d per_rank=%s num_workers=%d pair_chunk_size=%d",
             model.name,
+            benchmark_name,
             total,
             [len(list(benchmark.samples)[r :: dist_ctx.world_size]) for r in range(dist_ctx.world_size)],
             pipeline_cfg.num_workers_per_gpu if pipeline_cfg else 0,
@@ -1599,7 +1608,7 @@ def evaluate_winoground(
                 {
                     "model_name": model.name,
                     "model_type": model.model_type,
-                    "benchmark": "winoground",
+                    "benchmark": benchmark_name,
                     "sample_id": sample.sample_id,
                     "category": sample.category,
                     "image_0_path": str(sample.image_0_path),
@@ -1624,13 +1633,13 @@ def evaluate_winoground(
         except Exception as exc:
             skipped_samples.append(
                 {
-                    "benchmark": "winoground",
+                    "benchmark": benchmark_name,
                     "source_file": str(sample.source_file) if sample.source_file else "",
                     "sample_id": sample.sample_id,
                     "reason": f"evaluation failed: {exc!r}",
                 }
             )
-            logger.exception("Winoground sample failed: %s", sample.sample_id)
+            logger.exception("%s sample failed: %s", benchmark_name, sample.sample_id)
     if dist_ctx.use_shards:
         _write_jsonl_rows(rows, raw_path)
     else:
@@ -1642,8 +1651,9 @@ def evaluate_winoground(
     global_text, global_image, global_group, global_total = _dist_all_reduce_sum([local_text, local_image, local_group, local_total], dist_ctx)
     if dist_ctx.is_rank0:
         logger.info(
-            "%s/winoground metric aggregate: text=%d image=%d group=%d total=%d",
+            "%s/%s metric aggregate: text=%d image=%d group=%d total=%d",
             model.name,
+            benchmark_name,
             int(global_text),
             int(global_image),
             int(global_group),
@@ -1651,7 +1661,7 @@ def evaluate_winoground(
         )
     logger.info("Wrote %d raw rows to %s", len(rows), raw_path)
     if dist_ctx.use_shards:
-        return _merge_rank_jsonl(run_dir, model.name, "winoground", dist_ctx)
+        return _merge_rank_jsonl(run_dir, model.name, benchmark_name, dist_ctx)
     return pd.DataFrame(rows)
 
 
@@ -1665,14 +1675,27 @@ def write_summaries(
     aro_summary = summarize_aro(pairwise_df)
     sugar_summary = summarize_sugarcrepe(pairwise_df)
     winoground_summary = summarize_winoground(winoground_df)
+    pairwise_summary = summarize_pairwise_by_benchmark(pairwise_df)
+    two_by_two_summary = summarize_2x2_by_benchmark(winoground_df)
     margins_summary = summarize_margins(pairwise_df)
     ssr_summary = summarize_ssr(pairwise_df)
-    all_summary = summary_all_models(model_info, aro_summary, sugar_summary, winoground_summary, margins_summary, ssr_summary)
+    all_summary = summary_all_models(
+        model_info,
+        aro_summary,
+        sugar_summary,
+        winoground_summary,
+        margins_summary,
+        ssr_summary,
+        pairwise_summary,
+        two_by_two_summary,
+    )
     outputs = {
         "summary_all_models": all_summary,
         "summary_aro_by_category": aro_summary,
         "summary_sugarcrepe_by_category": sugar_summary,
         "summary_winoground": winoground_summary,
+        "summary_pairwise_by_benchmark": pairwise_summary,
+        "summary_2x2_by_benchmark": two_by_two_summary,
         "summary_margins": margins_summary,
         "summary_ssr": ssr_summary,
     }
@@ -1924,7 +1947,7 @@ def run_diagnostics(args: argparse.Namespace) -> Path:
                     logger.warning("Skipping benchmark %s for %s due to benchmark status=%s", benchmark_name, model_name, benchmark.status)
                     continue
                 logger.info("Scoring %s on %s (%d samples)", model_name, benchmark_name, len(benchmark.samples))
-                if benchmark_name in {"aro", "sugarcrepe"}:
+                if benchmark_name in {"aro", "sugarcrepe", "sugarcrepe_pp"}:
                     df = evaluate_pairwise_benchmark(
                         loaded.wrapper,
                         benchmark,
@@ -1942,7 +1965,7 @@ def run_diagnostics(args: argparse.Namespace) -> Path:
                     )
                     if dist_ctx.is_rank0 and not df.empty:
                         pairwise_frames.append(df)
-                elif benchmark_name == "winoground":
+                elif benchmark_name in {"winoground", "bivlc"}:
                     df = evaluate_winoground(
                         loaded.wrapper,
                         benchmark,

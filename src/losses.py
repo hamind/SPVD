@@ -10,16 +10,6 @@ import torch.nn.functional as F
 from open_clip.loss import SigLipLoss as OpenCLIPSigLipLoss
 from torch import Tensor, nn
 
-try:
-    import torch.distributed as dist
-except ImportError:  # pragma: no cover - distributed is available in normal torch wheels
-    dist = None
-
-try:
-    import torch.distributed.nn as dist_nn
-except ImportError:  # pragma: no cover
-    dist_nn = None
-
 
 def _zero(reference: Tensor | None = None) -> Tensor:
     if reference is None:
@@ -49,274 +39,78 @@ def assert_finite_tensor(name: str, tensor: Tensor | None, enabled: bool = False
         )
 
 
-def _distributed_ready(world_size: int) -> bool:
-    return bool(world_size > 1 and dist is not None and dist.is_available() and dist.is_initialized())
+class ResidualVarianceLoss(nn.Module):
+    """Variance floor for the residual branch."""
+
+    def __init__(self, gamma: float = 1.0, eps: float = 1.0e-4) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.eps = float(eps)
+
+    def forward(self, residual_features: Tensor) -> Tensor:
+        residual = residual_features.float().reshape(-1, residual_features.shape[-1])
+        std = torch.sqrt(residual.var(dim=0, unbiased=False) + self.eps)
+        return F.relu(self.gamma - std).mean()
 
 
-def _gather_one(
-    features: Tensor,
-    *,
-    local_loss: bool,
-    gather_with_grad: bool,
-    rank: int,
-    world_size: int,
-) -> Tensor:
-    if not _distributed_ready(world_size):
-        return features
-    if gather_with_grad:
-        if dist_nn is None:
-            raise RuntimeError("torch.distributed.nn is required when gather_with_grad=True.")
-        return torch.cat(dist_nn.all_gather(features), dim=0)
-
-    gathered = [torch.zeros_like(features) for _ in range(world_size)]
-    dist.all_gather(gathered, features)
-    if not local_loss:
-        gathered[rank] = features
-    return torch.cat(gathered, dim=0)
-
-
-def gather_features(
-    image_features: Tensor,
-    text_features: Tensor,
-    *,
-    local_loss: bool = False,
-    gather_with_grad: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
-) -> tuple[Tensor, Tensor]:
-    """Gather image/text features across ranks for contrastive losses."""
-    all_image_features = _gather_one(
-        image_features,
-        local_loss=local_loss,
-        gather_with_grad=gather_with_grad,
-        rank=rank,
-        world_size=world_size,
-    )
-    all_text_features = _gather_one(
-        text_features,
-        local_loss=local_loss,
-        gather_with_grad=gather_with_grad,
-        rank=rank,
-        world_size=world_size,
-    )
-    return all_image_features, all_text_features
-
-
-class InfoNCELoss(nn.Module):
-    """Symmetric CLIP InfoNCE loss implemented locally for project models."""
+class BranchBCELoss(nn.Module):
+    """Semantic-text positive BCE plus residual-text negative BCE."""
 
     def __init__(
         self,
-        local_loss: bool = False,
-        gather_with_grad: bool = False,
-        cache_labels: bool = False,
-        rank: int = 0,
-        world_size: int = 1,
+        logit_scale: float = 5.0,
+        residual_negative_weight: float = 0.25,
+        detach_text_for_residual: bool = True,
     ) -> None:
         super().__init__()
-        self.local_loss = bool(local_loss)
-        self.gather_with_grad = bool(gather_with_grad)
-        self.cache_labels = bool(cache_labels)
-        self.rank = int(rank)
-        self.world_size = int(world_size)
-        self._labels: dict[tuple[torch.device, int, int, bool], Tensor] = {}
+        self.logit_scale = float(logit_scale)
+        self.residual_negative_weight = float(residual_negative_weight)
+        self.detach_text_for_residual = bool(detach_text_for_residual)
 
-    def _ground_truth(self, device: torch.device, batch_size: int, distributed: bool) -> Tensor:
-        offset = self.rank * batch_size if distributed and self.local_loss else 0
-        key = (device, batch_size, offset, self.local_loss)
-        if not self.cache_labels or key not in self._labels:
-            self._labels[key] = torch.arange(batch_size, device=device, dtype=torch.long) + offset
-        return self._labels[key]
-
-    def forward(
-        self,
-        image_features: Tensor,
-        text_features: Tensor,
-        logit_scale: Tensor,
-        logit_bias: Tensor | None = None,
-    ) -> Tensor:
-        image_features = F.normalize(image_features.float(), dim=-1)
-        text_features = F.normalize(text_features.float(), dim=-1)
-        distributed = _distributed_ready(self.world_size)
-        all_image_features, all_text_features = gather_features(
-            image_features,
-            text_features,
-            local_loss=self.local_loss,
-            gather_with_grad=self.gather_with_grad,
-            rank=self.rank,
-            world_size=self.world_size,
-        )
-
-        if distributed and self.local_loss:
-            logits_per_image = logit_scale * image_features @ all_text_features.T
-            logits_per_text = logit_scale * text_features @ all_image_features.T
-            labels = self._ground_truth(image_features.device, image_features.shape[0], distributed=True)
-        else:
-            logits_per_image = logit_scale * all_image_features @ all_text_features.T
-            logits_per_text = logits_per_image.T
-            labels = self._ground_truth(logits_per_image.device, logits_per_image.shape[0], distributed=False)
-
-        if logit_bias is not None:
-            logits_per_image = logits_per_image + logit_bias
-            logits_per_text = logits_per_text + logit_bias
-        return (F.cross_entropy(logits_per_image, labels) + F.cross_entropy(logits_per_text, labels)) / 2
-
-
-def bidirectional_routing_bce_with_logits_loss(
-    routing_logits: Tensor,
-    relevance_scores: Tensor,
-    cue_weights: Tensor | None = None,
-    detach_relevance: bool = True,
-    positive_constraint: bool = True,
-    negative_constraint: bool = True,
-    target_eps: float = 1.0e-4,
-    pos_weight: float = 1.0,
-    neg_weight: float = 1.0,
-) -> Tensor:
-    """Stable bidirectional routing BCE in logits space.
-
-    Args:
-        routing_logits:
-            Binary logits for routing into the shared branch.
-            Shape: [B, S, M] or [B, K, S, M].
-            Positive logits indicate stronger shared routing.
-        relevance_scores:
-            Soft relevance target rho in [0, 1].
-            Same shape as routing_logits.
-            High rho encourages shared routing.
-            Low rho encourages residual/private routing.
-        cue_weights:
-            Optional cue weights.
-            Shape: [B, S] for [B, S, M] loss,
-            or [B, K, S] for [B, K, S, M] loss.
-        detach_relevance:
-            If True, stop gradient through rho.
-        positive_constraint:
-            Enable -rho * log sigmoid(logit).
-        negative_constraint:
-            Enable -(1-rho) * log sigmoid(-logit).
-        target_eps:
-            Clamp rho to avoid exact 0 or 1 soft labels.
-        pos_weight:
-            Weight for positive/shared direction.
-        neg_weight:
-            Weight for negative/residual direction.
-
-    Returns:
-        Scalar routing loss.
-    """
-    if routing_logits.shape != relevance_scores.shape:
-        raise ValueError(
-            "routing_logits and relevance_scores must have the same shape, "
-            f"got {tuple(routing_logits.shape)} and {tuple(relevance_scores.shape)}."
-        )
-
-    if not positive_constraint and not negative_constraint:
-        return routing_logits.new_zeros(())
-
-    logits = routing_logits.float()
-
-    rho = relevance_scores.detach() if detach_relevance else relevance_scores
-    rho = rho.float().clamp(target_eps, 1.0 - target_eps)
-
-    loss_terms: list[Tensor] = []
-
-    if positive_constraint:
-        # - rho * log(sigmoid(logits))
-        # Stable form of positive/shared routing BCE.
-        loss_pos = rho * F.softplus(-logits)
-        loss_terms.append(float(pos_weight) * loss_pos)
-
-    if negative_constraint:
-        # - (1-rho) * log(sigmoid(-logits))
-        # Stable form of negative/residual routing BCE.
-        loss_neg = (1.0 - rho) * F.softplus(logits)
-        loss_terms.append(float(neg_weight) * loss_neg)
-
-    loss = sum(loss_terms)
-
-    if cue_weights is not None:
-        weights = cue_weights.to(device=loss.device, dtype=loss.dtype)
-
-        if loss.ndim == 3:
-            # loss: [B, S, M], weights: [B, S]
-            if weights.ndim != 2:
-                raise ValueError(
-                    "For routing loss shape [B, S, M], cue_weights must have shape [B, S], "
-                    f"got {tuple(weights.shape)}."
-                )
-            weights = weights.unsqueeze(-1)
-
-        elif loss.ndim == 4:
-            # loss: [B, K, S, M], weights: [B, K, S]
-            if weights.ndim != 3:
-                raise ValueError(
-                    "For routing loss shape [B, K, S, M], cue_weights must have shape [B, K, S], "
-                    f"got {tuple(weights.shape)}."
-                )
-            weights = weights.unsqueeze(-1)
-
-        else:
+    def forward(self, shared_features: Tensor, residual_features: Tensor, text_features: Tensor) -> dict[str, Tensor]:
+        if shared_features.shape[:-1] != residual_features.shape[:-1]:
             raise ValueError(
-                "routing loss must have shape [B, S, M] or [B, K, S, M], "
-                f"got {tuple(loss.shape)}."
+                "shared_features and residual_features must have matching leading dimensions, "
+                f"got {tuple(shared_features.shape)} and {tuple(residual_features.shape)}."
             )
+        if shared_features.shape[:-1] != text_features.shape[:-1]:
+            raise ValueError(
+                "shared_features and text_features must have matching leading dimensions for branch BCE, "
+                f"got {tuple(shared_features.shape)} and {tuple(text_features.shape)}."
+            )
+        shared = F.normalize(shared_features.float().reshape(-1, shared_features.shape[-1]), dim=-1)
+        residual = F.normalize(residual_features.float().reshape(-1, residual_features.shape[-1]), dim=-1)
+        text = F.normalize(text_features.float().reshape(-1, text_features.shape[-1]), dim=-1)
+        residual_text = text.detach() if self.detach_text_for_residual else text
 
-        loss = loss * weights
-
-    return loss.mean()
-
-
-# Legacy probability-space routing BCE. Kept for backward compatibility only.
-def bidirectional_routing_bce_loss(
-    shared_routing: Tensor,
-    residual_routing: Tensor,
-    relevance_scores: Tensor,
-    cue_weights: Tensor | None = None,
-    detach_relevance: bool = True,
-    positive_constraint: bool = True,
-    negative_constraint: bool = True,
-    eps: float = 1.0e-6,
-) -> Tensor:
-    """BCE routing loss: high relevance to shared, low relevance to residual."""
-    rho = relevance_scores.detach() if detach_relevance else relevance_scores
-    terms: list[Tensor] = []
-    if positive_constraint:
-        terms.append(rho * torch.log(shared_routing + eps))
-    if negative_constraint:
-        terms.append((1.0 - rho) * torch.log(residual_routing + eps))
-    if not terms:
-        return shared_routing.new_zeros(())
-    loss = -sum(terms)
-    if cue_weights is not None:
-        loss = loss * cue_weights.to(device=loss.device, dtype=loss.dtype).unsqueeze(-1)
-    return loss.mean()
+        sim_s_text = (shared * text).sum(dim=-1)
+        sim_r_text = (residual * residual_text).sum(dim=-1)
+        logits_s = self.logit_scale * sim_s_text
+        logits_r = self.logit_scale * sim_r_text
+        loss_s_text = F.binary_cross_entropy_with_logits(logits_s, torch.ones_like(logits_s))
+        loss_r_text = F.binary_cross_entropy_with_logits(logits_r, torch.zeros_like(logits_r))
+        loss_branch = loss_s_text + self.residual_negative_weight * loss_r_text
+        return {
+            "loss_branch": loss_branch,
+            "loss_branch_s_text": loss_s_text,
+            "loss_branch_r_text": loss_r_text,
+            "branch_sim_s_text": sim_s_text.detach().mean(),
+            "branch_sim_r_text": sim_r_text.detach().mean(),
+            "branch_gap_s_minus_r": (sim_s_text.detach() - sim_r_text.detach()).mean(),
+        }
 
 
-def residual_preservation_loss(
-    residual_features: Tensor,
-    gamma: float = 1.0,
-    eps: float = 1.0e-4,
-) -> Tensor:
-    """Variance loss that discourages residual features from collapsing to constants."""
-    std = torch.sqrt(residual_features.float().var(dim=0, unbiased=False) + eps)
-    return F.relu(float(gamma) - std).mean()
+class GateMapStats(nn.Module):
+    """Scalar diagnostics for the sigmoid gate map."""
 
-
-def shared_residual_decorrelation_loss(
-    shared_features: Tensor,
-    residual_features: Tensor,
-    eps: float = 1.0e-6,
-) -> Tensor:
-    """Reduce linear redundancy between shared and residual representations."""
-    if shared_features.shape[0] < 2:
-        return _zero(shared_features)
-    z_s = shared_features.float() - shared_features.float().mean(dim=0, keepdim=True)
-    z_r = residual_features.float() - residual_features.float().mean(dim=0, keepdim=True)
-    z_s = z_s / (z_s.std(dim=0, unbiased=False, keepdim=True) + eps)
-    z_r = z_r / (z_r.std(dim=0, unbiased=False, keepdim=True) + eps)
-    cross_cov = z_s.transpose(0, 1) @ z_r / float(max(int(z_s.shape[0]) - 1, 1))
-    return cross_cov.pow(2).sum() / float(z_s.shape[-1])
+    def forward(self, sigmoid_map: Tensor) -> dict[str, Tensor]:
+        gate = sigmoid_map.detach().float()
+        return {
+            "gate_mean": gate.mean(),
+            "gate_std": gate.std(unbiased=False),
+            "gate_min": gate.min(),
+            "gate_max": gate.max(),
+        }
 
 
 class SPVDLoss(nn.Module):
@@ -331,12 +125,11 @@ class SPVDLoss(nn.Module):
         cache_labels: bool = False,
         rank: int = 0,
         world_size: int = 1,
-        decomp_loss_weight: float = 0.0,
-        route_positive_constraint: bool = True,
-        route_negative_constraint: bool = True,
-        residual_loss_weight: float = 0.0,
-        orth_loss_weight: float = 0.0,
-        detach_relevance: bool = True,
+        branch_bce_weight: float = 0.0,
+        branch_logit_scale: float = 5.0,
+        residual_negative_weight: float = 0.25,
+        detach_text_for_residual: bool = True,
+        residual_variance_weight: float = 0.0,
         residual_variance_gamma: float = 1.0,
         align_weight: float = 1.0,
         global_align_weight: float = 1.0,
@@ -354,13 +147,15 @@ class SPVDLoss(nn.Module):
         self.align_weight = float(align_weight)
         self.global_align_weight = float(global_align_weight)
         self.caption_align_weight = float(caption_align_weight)
-        self.decomp_loss_weight = float(decomp_loss_weight)
-        self.route_positive_constraint = bool(route_positive_constraint)
-        self.route_negative_constraint = bool(route_negative_constraint)
-        self.residual_loss_weight = float(residual_loss_weight)
-        self.orth_loss_weight = float(orth_loss_weight)
-        self.detach_relevance = bool(detach_relevance)
-        self.residual_variance_gamma = float(residual_variance_gamma)
+        self.branch_bce_weight = float(branch_bce_weight)
+        self.residual_variance_weight = float(residual_variance_weight)
+        self.branch_bce = BranchBCELoss(
+            logit_scale=branch_logit_scale,
+            residual_negative_weight=residual_negative_weight,
+            detach_text_for_residual=detach_text_for_residual,
+        )
+        self.residual_variance = ResidualVarianceLoss(gamma=residual_variance_gamma)
+        self.gate_stats = GateMapStats()
         self.debug_finite_checks = bool(debug_finite_checks)
 
     def forward(self, outputs: Mapping[str, Any] | tuple[Tensor, ...]) -> tuple[Tensor, dict[str, Tensor]]:
@@ -371,8 +166,8 @@ class SPVDLoss(nn.Module):
                 "logit_scale": outputs[2],
             }
 
-        image_features = _first_tensor(outputs, ("image_features", "shared_visual_features", "z_v_s"))
-        text_features = _first_tensor(outputs, ("text_features", "z_t", "text_global"))
+        image_features = _first_tensor(outputs, ("shared_visual_features", "image_features"))
+        text_features = _first_tensor(outputs, ("text_features",))
         caption_visual_features = _first_tensor(outputs, ("caption_shared_visual_features",))
         caption_text_features = _first_tensor(outputs, ("caption_text_features",))
         logit_scale = _first_tensor(outputs, ("logit_scale",))
@@ -380,14 +175,25 @@ class SPVDLoss(nn.Module):
         if logit_scale is None:
             raise KeyError("SPVDLoss requires logit_scale.")
 
+        if caption_visual_features is None and image_features is not None and image_features.ndim == 3:
+            caption_visual_features = image_features
+
         normalized_image_features = F.normalize(image_features, dim=-1) if image_features is not None else None
         align_terms: list[tuple[float, Tensor]] = []
         zero_reference = normalized_image_features
         if zero_reference is None:
             zero_reference = caption_visual_features if caption_visual_features is not None else caption_text_features
 
-        if image_features is not None and text_features is not None and self.global_align_weight != 0.0:
-            loss_align_global = self.align_loss(image_features, text_features, logit_scale, logit_bias=logit_bias)
+        if (
+            image_features is not None
+            and text_features is not None
+            and image_features.ndim == 2
+            and text_features.ndim == 2
+            and self.global_align_weight != 0.0
+        ):
+            align_global_image = F.normalize(image_features.float(), dim=-1)
+            align_global_text = F.normalize(text_features.float(), dim=-1)
+            loss_align_global = self.align_loss(align_global_image, align_global_text, logit_scale, logit_bias=logit_bias)
             align_terms.append((self.global_align_weight, loss_align_global))
         else:
             loss_align_global = _zero(zero_reference)
@@ -399,8 +205,14 @@ class SPVDLoss(nn.Module):
                     f"for caption-level sigmoid loss, got {tuple(caption_visual_features.shape)} and "
                     f"{tuple(caption_text_features.shape)}."
                 )
-            align_image_features = caption_visual_features.reshape(-1, caption_visual_features.shape[-1])
-            align_text_features = caption_text_features.reshape(-1, caption_text_features.shape[-1])
+            align_image_features = F.normalize(
+                caption_visual_features.reshape(-1, caption_visual_features.shape[-1]).float(),
+                dim=-1,
+            )
+            align_text_features = F.normalize(
+                caption_text_features.reshape(-1, caption_text_features.shape[-1]).float(),
+                dim=-1,
+            )
             if self.caption_align_weight != 0.0:
                 loss_align_caption = self.align_loss(align_image_features, align_text_features, logit_scale, logit_bias=logit_bias)
                 align_terms.append((self.caption_align_weight, loss_align_caption))
@@ -419,61 +231,73 @@ class SPVDLoss(nn.Module):
         loss_align = sum(weight * term for weight, term in align_terms) / align_weight_sum
 
         zero = _zero(align_image_features)
-        routing_logits = _first_tensor(outputs, ("routing_logits",))
-        shared_routing = _first_tensor(outputs, ("shared_routing",))
-        residual_routing = _first_tensor(outputs, ("residual_routing",))
-        relevance_scores = _first_tensor(outputs, ("relevance_scores",))
-        cue_weights = _first_tensor(outputs, ("cue_weights",))
-        residual_features = _first_tensor(outputs, ("residual_visual_features", "z_v_p"))
-
-        has_decomp = routing_logits is not None or relevance_scores is not None
-        if has_decomp and (routing_logits is None or relevance_scores is None or residual_features is None):
-            raise KeyError(
-                "Soft-cue loss requires routing_logits, relevance_scores, and residual_visual_features."
-            )
+        gate_logits = _first_tensor(outputs, ("gate_logits",))
+        sigmoid_map = _first_tensor(outputs, ("sigmoid_map",))
+        residual_map = _first_tensor(outputs, ("residual_map",))
+        residual_features = _first_tensor(outputs, ("residual_visual_features",))
+        has_decomp = sigmoid_map is not None or gate_logits is not None or residual_features is not None
+        if has_decomp and (sigmoid_map is None or residual_map is None or gate_logits is None or residual_features is None):
+            raise KeyError("Sigmoid decomposition loss requires sigmoid_map, residual_map, gate_logits, and residual_visual_features.")
 
         if self.debug_finite_checks:
-            assert_finite_tensor("routing_logits", routing_logits, enabled=True)
-            assert_finite_tensor("shared_routing", shared_routing, enabled=True)
-            assert_finite_tensor("residual_routing", residual_routing, enabled=True)
-            assert_finite_tensor("relevance_scores", relevance_scores, enabled=True)
+            assert_finite_tensor("gate_logits", gate_logits, enabled=True)
+            assert_finite_tensor("sigmoid_map", sigmoid_map, enabled=True)
+            assert_finite_tensor("residual_map", residual_map, enabled=True)
             assert_finite_tensor("caption_shared_visual_features", caption_visual_features, enabled=True)
             assert_finite_tensor("shared_visual_features", image_features, enabled=True)
             assert_finite_tensor("residual_visual_features", residual_features, enabled=True)
 
-        if has_decomp and self.decomp_loss_weight != 0.0:
-            loss_decomp = bidirectional_routing_bce_with_logits_loss(
-                routing_logits=routing_logits,
-                relevance_scores=relevance_scores,
-                cue_weights=cue_weights,
-                detach_relevance=self.detach_relevance,
-                positive_constraint=self.route_positive_constraint,
-                negative_constraint=self.route_negative_constraint,
-            ).to(align_image_features.device)
-        else:
-            loss_decomp = zero
+        branch_text_features = text_features
+        if (
+            image_features is not None
+            and image_features.ndim == 3
+            and caption_text_features is not None
+            and caption_text_features.shape[:-1] == image_features.shape[:-1]
+        ):
+            branch_text_features = caption_text_features
 
-        if has_decomp and self.residual_loss_weight != 0.0:
-            loss_residual = residual_preservation_loss(residual_features, gamma=self.residual_variance_gamma).to(align_image_features.device)
+        if has_decomp and image_features is not None and residual_features is not None and branch_text_features is not None:
+            branch_terms = {
+                key: value.to(align_image_features.device)
+                for key, value in self.branch_bce(image_features, residual_features, branch_text_features).items()
+            }
         else:
-            loss_residual = zero
+            branch_terms = {
+                "loss_branch": zero,
+                "loss_branch_s_text": zero,
+                "loss_branch_r_text": zero,
+                "branch_sim_s_text": zero,
+                "branch_sim_r_text": zero,
+                "branch_gap_s_minus_r": zero,
+            }
 
-        if has_decomp and self.orth_loss_weight != 0.0:
-            orth_anchor = normalized_image_features if normalized_image_features is not None else align_image_features
-            loss_orth = shared_residual_decorrelation_loss(orth_anchor, residual_features).to(align_image_features.device)
+        if has_decomp and residual_features is not None:
+            loss_residual_variance = self.residual_variance(residual_features).to(align_image_features.device)
         else:
-            loss_orth = zero
+            loss_residual_variance = zero
+
+        if sigmoid_map is not None:
+            gate_terms = {
+                key: value.to(align_image_features.device)
+                for key, value in self.gate_stats(sigmoid_map).items()
+            }
+        else:
+            gate_terms = {
+                "gate_mean": zero,
+                "gate_std": zero,
+                "gate_min": zero,
+                "gate_max": zero,
+            }
 
         total_loss = (
             self.align_weight * loss_align
-            + self.decomp_loss_weight * loss_decomp
-            + self.residual_loss_weight * loss_residual
-            + self.orth_loss_weight * loss_orth
+            + self.branch_bce_weight * branch_terms["loss_branch"]
+            + self.residual_variance_weight * loss_residual_variance
         )
         if self.debug_finite_checks:
             assert_finite_tensor("loss_align", loss_align, enabled=True)
-            assert_finite_tensor("loss_decomp", loss_decomp, enabled=True)
-            assert_finite_tensor("loss_orth", loss_orth, enabled=True)
+            assert_finite_tensor("loss_branch", branch_terms["loss_branch"], enabled=True)
+            assert_finite_tensor("loss_residual_variance", loss_residual_variance, enabled=True)
             assert_finite_tensor("total_loss", total_loss, enabled=True)
         return total_loss, {
             "loss": total_loss.detach(),
@@ -481,8 +305,16 @@ class SPVDLoss(nn.Module):
             "loss_sigmoid": loss_align.detach(),
             "loss_align_global": loss_align_global.detach(),
             "loss_align_caption": loss_align_caption.detach(),
-            "loss_decomp": loss_decomp.detach(),
-            "loss_residual": loss_residual.detach(),
-            "loss_orth": loss_orth.detach(),
+            "loss_branch": branch_terms["loss_branch"].detach(),
+            "loss_branch_s_text": branch_terms["loss_branch_s_text"].detach(),
+            "loss_branch_r_text": branch_terms["loss_branch_r_text"].detach(),
+            "branch_sim_s_text": branch_terms["branch_sim_s_text"].detach(),
+            "branch_sim_r_text": branch_terms["branch_sim_r_text"].detach(),
+            "branch_gap_s_minus_r": branch_terms["branch_gap_s_minus_r"].detach(),
+            "loss_residual_variance": loss_residual_variance.detach(),
+            "gate_mean": gate_terms["gate_mean"].detach(),
+            "gate_std": gate_terms["gate_std"].detach(),
+            "gate_min": gate_terms["gate_min"].detach(),
+            "gate_max": gate_terms["gate_max"].detach(),
             "logit_scale": logit_scale.detach(),
         }

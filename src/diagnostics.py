@@ -252,9 +252,9 @@ def collect_feature_tensors(outputs: Any) -> dict[str, Tensor]:
             return {"image_features": outputs[0], "text_features": outputs[1]}
         return {}
     aliases = {
-        "z_vs": ("z_v_s", "image_features_shared", "shared_features", "zs", "shared_global", "image_features"),
-        "z_vp": ("z_v_p", "image_features_private", "private_features", "zp", "private_global", "residual_visual_features"),
-        "z_t": ("z_t", "text_features", "text_global"),
+        "z_vs": ("shared_visual_features", "image_features"),
+        "z_vp": ("residual_visual_features",),
+        "z_t": ("text_features",),
     }
     found: dict[str, Tensor] = {}
     for canonical, names in aliases.items():
@@ -278,12 +278,12 @@ def compute_logits_stats(outputs: Any, eps: float = 1.0e-12) -> dict[str, float]
         return None
 
     if isinstance(outputs, dict):
-        for name in ("routing_logits", "shared_routing", "residual_routing", "relevance_scores"):
+        for name in ("gate_logits", "sigmoid_map", "residual_map"):
             value = outputs.get(name)
             if torch.is_tensor(value):
                 stats.update(tensor_stats(f"train/{name}", value))
-        image = first_tensor(outputs, ("image_features", "z_v_s", "shared_global"))
-        text = first_tensor(outputs, ("text_features", "z_t", "text_global"))
+        image = first_tensor(outputs, ("shared_visual_features", "image_features"))
+        text = first_tensor(outputs, ("text_features",))
         logit_scale = outputs.get("logit_scale")
         temperature = outputs.get("temperature")
     elif isinstance(outputs, (tuple, list)) and len(outputs) >= 3:
