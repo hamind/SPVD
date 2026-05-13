@@ -36,15 +36,39 @@ class ParseKwargs(argparse.Action):
         setattr(namespace, self.dest, kwargs)
 
 
+def _deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge YAML config dictionaries."""
+    merged = dict(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_update(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _read_yaml(path: str | None) -> dict[str, Any]:
-    """Read a YAML config if provided."""
+    """Read a YAML config if provided, resolving optional ``extends`` chains."""
     if not path:
         return {}
-    with Path(path).open("r", encoding="utf-8") as handle:
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Config must be a mapping: {path}")
-    return payload
+    extends = payload.get("extends")
+    if not extends:
+        return payload
+    parents = extends if isinstance(extends, list) else [extends]
+    merged: dict[str, Any] = {}
+    for parent in parents:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = config_path.parent / parent_path
+        merged = _deep_update(merged, _read_yaml(str(parent_path)))
+    return _deep_update(merged, payload)
 
 
 def _default_from_config(config: dict[str, Any], section: str, key: str, default: Any = None) -> Any:
@@ -60,6 +84,13 @@ def _default_loss_value(config: dict[str, Any], key: str, default: Any = None) -
     if key in config:
         return config[key]
     return _default_from_config(config, "loss", key, default)
+
+
+def _default_training_value(config: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Fetch training defaults from top-level keys or the nested training section."""
+    if key in config:
+        return config[key]
+    return _default_from_config(config, "training", key, default)
 
 
 def _default_model_name(config: dict[str, Any]) -> str:
@@ -154,6 +185,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--align-weight", type=float, default=_default_loss_value(config, "align_weight", 1.0))
     parser.add_argument("--global-align-weight", type=float, default=_default_loss_value(config, "global_align_weight", 1.0))
     parser.add_argument("--caption-align-weight", type=float, default=_default_loss_value(config, "caption_align_weight", 1.0))
+    parser.add_argument("--caption-same-image-mode", default=_default_loss_value(config, "caption_same_image_mode", "ignore"))
     parser.add_argument("--branch-bce-weight", type=float, default=_default_loss_value(config, "branch_bce_weight", 0.0))
     parser.add_argument("--branch-logit-scale", type=float, default=_default_loss_value(config, "branch_logit_scale", 5.0))
     parser.add_argument("--residual-negative-weight", type=float, default=_default_loss_value(config, "residual_negative_weight", 0.25))
@@ -168,8 +200,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--beta2", type=float, default=beta2)
     parser.add_argument("--eps", type=float, default=_default_from_config(config, "optim", "eps", default_optim["eps"]))
     parser.add_argument("--warmup", type=int, default=_default_from_config(config, "optim", "warmup_steps", 2000))
-    parser.add_argument("--accum-freq", type=int, default=_default_from_config(config, "optim", "grad_accum_steps", 1))
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=bool(_default_training_value(config, "torch_compile", False)))
+    parser.add_argument("--torch-compile-backend", default=_default_training_value(config, "torch_compile_backend", "inductor"))
+    parser.add_argument("--torch-compile-mode", default=_default_training_value(config, "torch_compile_mode", None))
 
     parser.add_argument("--logs", "--logs-dir", dest="logs_dir", default=_default_from_config(config, "experiment", "output_dir", "outputs"))
     parser.add_argument("--name", default=_default_from_config(config, "experiment", "name"))

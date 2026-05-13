@@ -10,7 +10,7 @@ from typing import Sequence
 import numpy as np
 import torch
 import yaml
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel
 
 from checkpoint import load_checkpoint, save_checkpoint
@@ -45,6 +45,22 @@ def _optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device)
         for name, value in state.items():
             if torch.is_tensor(value):
                 state[name] = value.to(device)
+
+
+def _maybe_compile_model(model: torch.nn.Module, args: object, logger: object) -> torch.nn.Module:
+    """Optionally wrap the model with torch.compile."""
+    if not bool(getattr(args, "torch_compile", False)):
+        return model
+    if not hasattr(torch, "compile"):
+        logger.warning("torch.compile requested but this PyTorch build has no torch.compile; continuing without compile")
+        return model
+    backend = getattr(args, "torch_compile_backend", "inductor")
+    mode = getattr(args, "torch_compile_mode", None)
+    compile_kwargs: dict[str, object] = {"backend": backend}
+    if mode:
+        compile_kwargs["mode"] = mode
+    logger.info("compiling model with torch.compile backend=%s mode=%s", backend, mode)
+    return torch.compile(model, **compile_kwargs)
 
 
 def _resolved_config(args: object) -> dict[str, object]:
@@ -126,6 +142,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume_step = int(resume_payload.get("step", 0) or 0)
             logger.info("loaded checkpoint model state: %s (epoch=%d, step=%d)", args.resume, resume_epoch, resume_step)
 
+        model = _maybe_compile_model(model, args, logger)
+
         if args.distributed:
             model = DistributedDataParallel(model, device_ids=[args.local_rank] if args.device.type == "cuda" else None)
 
@@ -162,7 +180,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         logger.info("starting training at epoch=%d, global_step=%d", start_epoch, global_step)
         for epoch in range(start_epoch, int(args.epochs) + 1):
             train_info.set_epoch(epoch)
-            steps = train_one_epoch(model, train_info.dataloader, loss_fn, optimizer, scaler, scheduler, epoch, args, logger, writer, global_step)
+            steps = train_one_epoch(model, data, loss_fn, epoch, optimizer, scaler, scheduler, model, args, writer)
             global_step += steps
             reached_step_limit = args.max_steps is not None and global_step >= int(args.max_steps)
             is_final_epoch = epoch == int(args.epochs)

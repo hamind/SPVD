@@ -1,0 +1,11 @@
+extends: spvd_full.yaml
+
+experiment:
+  name: spvd_full_bce01_compile
+  output_dir: /vepfs/code/SPVD/outputs/experiments/spvd_full_bce01_compile
+
+loss:
+  branch_bce_weight: 0.1
+
+training:
+  torch_compile: true

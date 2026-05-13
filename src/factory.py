@@ -298,6 +298,7 @@ def create_loss(args: object) -> nn.Module:
             detach_text_for_residual=bool(getattr(args, "detach_text_for_residual", True)),
             residual_variance_weight=float(getattr(args, "residual_variance_weight", 0.0)),
             residual_variance_gamma=float(getattr(args, "residual_variance_gamma", 1.0)),
+            caption_same_image_mode=getattr(args, "caption_same_image_mode", "ignore"),
             align_weight=float(getattr(args, "align_weight", 1.0)),
             global_align_weight=float(getattr(args, "global_align_weight", 1.0)),
             caption_align_weight=float(getattr(args, "caption_align_weight", 1.0)),

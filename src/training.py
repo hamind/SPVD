@@ -1,26 +1,16 @@
-﻿"""Training and feature-extraction loops."""
+"""Training and feature-extraction loops."""
 
 from __future__ import annotations
 
+import logging
+import math
 import time
-from collections import deque
-from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
 from torch.cuda.amp import GradScaler
 
-from diagnostics import (
-    collect_feature_tensors,
-    compute_feature_stats,
-    compute_global_param_stats,
-    compute_logits_stats,
-    compute_redundancy_stats,
-    compute_update_stats,
-    snapshot_params_for_update,
-    write_jsonl,
-)
 from distributed import is_master
 
 
@@ -45,7 +35,15 @@ class AverageMeter:
 
 def unwrap_model(model: nn.Module) -> nn.Module:
     """Return the underlying module when wrapped by DDP-like containers."""
-    return model.module if hasattr(model, "module") else model
+    unwrapped = model
+    while True:
+        if hasattr(unwrapped, "module"):
+            unwrapped = unwrapped.module
+            continue
+        if hasattr(unwrapped, "_orig_mod"):
+            unwrapped = unwrapped._orig_mod
+            continue
+        return unwrapped
 
 
 def backward(total_loss: torch.Tensor, scaler: GradScaler | None) -> None:
@@ -62,6 +60,34 @@ def _autocast(args: object):
     enabled = precision in {"amp", "amp_bf16", "bf16"} and torch.cuda.is_available()
     dtype = torch.bfloat16 if precision in {"amp_bf16", "bf16"} else torch.float16
     return torch.autocast("cuda", dtype=dtype, enabled=enabled)
+
+
+def _input_dtype(args: object) -> torch.dtype | None:
+    """Return image input dtype matching the precision mode."""
+    precision = str(getattr(args, "precision", "amp"))
+    if precision in {"fp16", "pure_fp16"}:
+        return torch.float16
+    if precision in {"bf16", "pure_bf16"}:
+        return torch.bfloat16
+    return None
+
+
+def _get_batch_tensors(batch: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return image and text tensors from the project dataloader batch."""
+    if isinstance(batch, dict):
+        return batch["image"], batch["text"]
+    return batch[:2]
+
+
+def _loader_count(dataloader: Any, attr: str, fallback: int) -> int:
+    """Read dataloader metadata without forcing ``len`` on iterable loaders."""
+    value = getattr(dataloader, attr, None)
+    if value is not None:
+        return int(value)
+    try:
+        return int(len(dataloader))
+    except TypeError:
+        return fallback
 
 
 
@@ -145,230 +171,133 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
     return metrics
 
 
-def _write_tb_scalars(tb_writer: Any | None, metrics: dict[str, float], step: int) -> None:
-    if tb_writer is None:
-        return
-    for key, value in metrics.items():
-        if isinstance(value, (int, float)):
-            tb_writer.add_scalar(key, value, step)
+def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
+    device = torch.device(args.device)
+    autocast = lambda: _autocast(args)
+    input_dtype = _input_dtype(args)
 
-
-def _compute_loss(loss_fn: nn.Module, outputs: Any, args: object, device: torch.device) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute CLIP, SigLIP, or SPVD loss."""
-    if bool(getattr(loss_fn, "expects_output_dict", False)):
-        total_loss, loss_dict = loss_fn(outputs)
-        return total_loss, loss_dict
-
-    image_features, text_features, logit_scale, logit_bias = _unpack_outputs(outputs, device)
-    if bool(getattr(args, "siglip", False)):
-        loss = loss_fn(image_features, text_features, logit_scale, logit_bias)
-    else:
-        loss = loss_fn(image_features, text_features, logit_scale)
-    return loss, _scalar_loss_dict(loss, logit_scale)
-
-
-def train_one_epoch(
-    model: nn.Module,
-    data_loader: Any,
-    loss_fn: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
-    scheduler: Any,
-    epoch: int,
-    args: object,
-    logger: Any,
-    tb_writer: Any | None = None,
-    global_step_offset: int = 0,
-) -> int:
-    """Train one epoch and return optimizer steps."""
     model.train()
-    optimizer.zero_grad(set_to_none=True)
-    device = getattr(args, "device")
-    accum_freq = max(int(getattr(args, "accum_freq", 1)), 1)
-    log_interval = int(getattr(args, "log_every_n_steps", 50))
-    diagnostics_enabled = bool(getattr(args, "diagnostics_enabled", True))
-    diag_log_interval = max(int(getattr(args, "diagnostics_log_interval", log_interval)), 1)
-    heavy_log_interval = max(int(getattr(args, "diagnostics_heavy_log_interval", 500)), 1)
-    diag_eps = float(getattr(args, "diagnostics_eps", 1.0e-12))
-    log_update_rms = bool(getattr(args, "diagnostics_log_update_rms", True))
-    log_effective_rank = bool(getattr(args, "diagnostics_log_effective_rank", True))
-    log_redundancy = bool(getattr(args, "diagnostics_log_redundancy", True))
-    per_layer = bool(getattr(args, "diagnostics_per_layer", True))
-    max_logged_layers = int(getattr(args, "diagnostics_max_logged_layers", 80))
-    diag_dir = Path(getattr(args, "log_dir", getattr(args, "logs_dir", ".")))
-    train_metrics_path = diag_dir / "train_metrics.jsonl"
-    per_layer_path = diag_dir / "diagnostics_per_layer.jsonl"
-    summary_path = diag_dir / "diagnostics_summary.json"
-    world_size = int(getattr(args, "world_size", 1))
+
+    if isinstance(data, dict):
+        data["train"].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
+        dataloader = data["train"].dataloader
+    else:
+        dataloader = getattr(data, "dataloader", data)
+
+    raw_num_batches = _loader_count(dataloader, "num_batches", 1)
+    raw_num_samples = _loader_count(dataloader, "num_samples", raw_num_batches * int(args.batch_size) * int(args.world_size))
+    num_batches_per_epoch = max(raw_num_batches, 1)
+    sample_digits = math.ceil(math.log(raw_num_samples + 1, 10))
+
+    losses_m = {}
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
-    end = time.perf_counter()
-    start = end
-    samples_seen = 0
+    logger = logging.getLogger("spvd")
+    end = time.time()
     optimizer_steps = 0
-    recent_clip_flags: deque[bool] = deque(maxlen=100)
-    last_diagnostics: dict[str, float] = {}
+    for i, batch in enumerate(dataloader):
+        step = num_batches_per_epoch * (epoch - 1) + i
 
-    for step, batch in enumerate(data_loader, start=1):
-        data_time_m.update(time.perf_counter() - end)
-        images = batch["image"].to(device, non_blocking=True)
-        texts = batch["text"].to(device, non_blocking=True)
-        if scheduler is not None:
-            scheduler(global_step_offset + optimizer_steps)
-        with _autocast(args):
-            outputs = model(images, texts)
-            raw_loss, loss_dict = _compute_loss(loss_fn, outputs, args, device)
-            loss = raw_loss / accum_freq
-        backward(loss, scaler)
-        samples_seen += images.shape[0] * world_size
+        if not bool(getattr(args, "skip_scheduler", False)):
+            scheduler(step)
 
-        if step % accum_freq == 0:
-            next_optimizer_step = global_step_offset + optimizer_steps + 1
-            should_log_diag = diagnostics_enabled and next_optimizer_step % diag_log_interval == 0
-            should_log_heavy = diagnostics_enabled and next_optimizer_step % heavy_log_interval == 0
-            if scaler is not None and scaler.is_enabled() and (should_log_diag or should_log_heavy):
+        images, texts = _get_batch_tensors(batch)
+        images = images.to(device=device, dtype=input_dtype, non_blocking=True)
+        texts = texts.to(device=device, non_blocking=True)
+
+        data_time_m.update(time.time() - end)
+        optimizer.zero_grad()
+
+        with autocast():
+            model_out = model(images, texts)
+            logit_scale = model_out["logit_scale"]
+            losses = loss(**model_out, output_dict=True)
+
+            total_loss = sum(losses.values())
+            losses["loss"] = total_loss
+
+        backward(total_loss, scaler)
+
+        if scaler is not None:
+            if bool(getattr(args, "horovod", False)):
+                optimizer.synchronize()
                 scaler.unscale_(optimizer)
-            grad_stats = compute_global_param_stats(model, distributed=bool(getattr(args, "distributed", False)), eps=diag_eps) if should_log_diag else {}
-            grad_norm_before_clip = grad_stats.get("grad_norm")
-            grad_norm_after_clip = grad_norm_before_clip
-            clip_applied = False
-            recent_clip_flags.append(clip_applied)
-            update_snapshot = None
-            if should_log_diag and log_update_rms:
-                update_snapshot = snapshot_params_for_update(model)
-            old_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else None
-            scaler.step(optimizer)
+                grad_clip_norm = getattr(args, "grad_clip_norm", None)
+                if grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
+                with optimizer.skip_synchronize():
+                    scaler.step(optimizer)
+            else:
+                grad_clip_norm = getattr(args, "grad_clip_norm", None)
+                if grad_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
+                scaler.step(optimizer)
             scaler.update()
-            new_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else old_scale
-            optimizer_step_skipped = bool(old_scale is not None and new_scale is not None and new_scale < old_scale)
-            update_stats: dict[str, float] = {}
-            layer_records: list[dict[str, float | str]] = []
-            if should_log_diag and log_update_rms:
-                if optimizer_step_skipped:
-                    update_stats = {"update_rms": 0.0, "update_weight_ratio": 0.0}
-                else:
-                    update_stats, layer_records = compute_update_stats(
-                        model,
-                        update_snapshot,
-                        distributed=bool(getattr(args, "distributed", False)),
-                        eps=diag_eps,
-                        max_logged_layers=max_logged_layers if per_layer and should_log_heavy else 0,
-                    )
-            optimizer.zero_grad(set_to_none=True)
-            optimizer_steps += 1
-            if should_log_diag and is_master(args):
-                elapsed = max(time.perf_counter() - start, 1e-6)
-                lr = optimizer.param_groups[0]["lr"]
-                raw_loss_value = float((loss.detach() * accum_freq).cpu())
-                metrics: dict[str, float] = {
-                    "train/lr": float(lr),
-                    "train/data_time": float(data_time_m.val),
-                    "train/batch_time": float(batch_time_m.val),
-                    "train/samples_per_second": samples_seen / elapsed,
-                    "train/grad_norm_before_clip": float(grad_norm_before_clip or 0.0),
-                    "train/grad_norm_after_clip": float(grad_norm_after_clip or 0.0),
-                    "train/clip_applied": float(clip_applied),
-                    "train/clip_fraction": sum(recent_clip_flags) / max(len(recent_clip_flags), 1),
-                    "train/optimizer_step_skipped": float(optimizer_step_skipped),
-                }
-                metrics.update(_prefixed_loss_values(loss_dict, loss.detach() * accum_freq))
-                metrics.update({f"train/{key}": value for key, value in grad_stats.items()})
-                metrics.update({f"train/{key}": value for key, value in update_stats.items()})
-                metrics.update(compute_logits_stats(outputs, eps=diag_eps))
-                if should_log_heavy:
-                    features = collect_feature_tensors(outputs)
-                    if log_effective_rank:
-                        for name, tensor in features.items():
-                            metrics.update(compute_feature_stats(tensor, f"train/{name}", eps=diag_eps))
-                    if log_redundancy:
-                        metrics.update(compute_redundancy_stats(features.get("z_vs"), features.get("z_vp"), eps=diag_eps))
-                record = {
-                    "step": step,
-                    "epoch": epoch,
-                    "global_step": next_optimizer_step,
-                    "lr": lr,
-                    "loss_total": metrics.get("train/loss_total", raw_loss_value),
-                    "grad_rms": metrics.get("train/grad_rms"),
-                    "weight_rms": metrics.get("train/weight_rms"),
-                    "update_rms": metrics.get("train/update_rms"),
-                    **metrics,
-                }
-                write_jsonl(train_metrics_path, record)
-                if per_layer and should_log_heavy:
-                    for layer_record in layer_records:
-                        write_jsonl(per_layer_path, {"step": step, "epoch": epoch, "global_step": next_optimizer_step, **layer_record})
-                        layer_name = str(layer_record["layer_name"])
-                        for key in ("weight_rms", "grad_rms", "update_rms", "update_weight_ratio"):
-                            metrics[f"train/layer/{layer_name}/{key}"] = float(layer_record[key])
-                _write_tb_scalars(tb_writer, metrics, next_optimizer_step)
-                last_diagnostics = metrics
+        else:
+            grad_clip_norm = getattr(args, "grad_clip_norm", None)
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
+            optimizer.step()
+        optimizer_steps += 1
 
-        if is_master(args) and step % log_interval == 0:
-            elapsed = max(time.perf_counter() - start, 1e-6)
-            lr = optimizer.param_groups[0]["lr"]
-            _, _, logit_scale, _ = _unpack_outputs(outputs, device)
-            raw_loss_value = float((loss.detach() * accum_freq).cpu())
-            logit_scale_value = float(logit_scale.detach().cpu())
-            samples_per_second = samples_seen / elapsed
-            batch_time_m.update(time.perf_counter() - end)
-            loss_values = _loss_dict_to_floats(loss_dict)
-            aux_keys = (
-                "loss_align",
-                "loss_sigmoid",
-                "loss_align_global",
-                "loss_align_caption",
-                "loss_branch",
-                "loss_branch_s_text",
-                "loss_branch_r_text",
-                "branch_sim_s_text",
-                "branch_sim_r_text",
-                "branch_gap_s_minus_r",
-                "loss_residual_variance",
-                "gate_mean",
-                "gate_std",
-                "gate_min",
-                "gate_max",
-                "loss_pri",
-                "loss_dis",
-                "loss_sem",
-                "shared_coverage",
-                "private_coverage",
+        reached_step_limit = args.max_steps is not None and optimizer_steps >= int(args.max_steps)
+
+        # Note: we clamp to 4.6052 = ln(100), as in the original paper.
+        with torch.no_grad():
+            unwrap_model(model).logit_scale.clamp_(0, math.log(100))
+
+        batch_time_m.update(time.time() - end)
+        end = time.time()
+        batch_count = i + 1
+        if is_master(args) and (i % args.log_every_n_steps == 0 or batch_count == num_batches_per_epoch or reached_step_limit):
+            batch_size = len(images)
+            num_samples = batch_count * batch_size * args.world_size
+            samples_per_epoch = raw_num_samples
+            percent_complete = 100.0 * batch_count / num_batches_per_epoch
+
+            # NOTE loss is coarsely sampled, just master node and per log update
+            for key, val in losses.items():
+                if key not in losses_m:
+                    losses_m[key] = AverageMeter()
+                losses_m[key].update(val.item(), batch_size)
+
+            logit_scale_scalar = logit_scale.item()
+            loss_log = " ".join(
+                [
+                    f"{loss_name.capitalize()}: {loss_m.val:#.5g} ({loss_m.avg:#.5g})"
+                    for loss_name, loss_m in losses_m.items()
+                ]
             )
-            aux_text = " ".join(f"{key}={loss_values[key]:.4f}" for key in aux_keys if key in loss_values)
+            samples_per_second = args.batch_size * args.world_size / batch_time_m.val
+            samples_per_second_per_gpu = args.batch_size / batch_time_m.val
             logger.info(
-                "epoch=%s step=%s loss=%.4f logit_scale=%.3f lr=%.6g data_time=%.3f batch_time=%.3f samples/sec=%.2f%s",
-                epoch,
-                step,
-                raw_loss_value,
-                logit_scale_value,
-                lr,
-                data_time_m.avg,
-                batch_time_m.avg,
-                samples_per_second,
-                f" {aux_text}" if aux_text else "",
+                f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
+                f"Data (t): {data_time_m.avg:.3f} "
+                f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
+                f"LR: {optimizer.param_groups[0]['lr']:5f} "
+                f"Logit Scale: {math.log(logit_scale_scalar):.3f} " + loss_log
             )
-            if tb_writer is not None and not (diagnostics_enabled and (global_step_offset + optimizer_steps) % diag_log_interval == 0):
-                tb_step = global_step_offset + optimizer_steps
-                tb_writer.add_scalar("train/loss", raw_loss_value, tb_step)
-                tb_writer.add_scalar("train/logit_scale", logit_scale_value, tb_step)
-                tb_writer.add_scalar("train/lr", lr, tb_step)
-                tb_writer.add_scalar("train/data_time", data_time_m.val, tb_step)
-                tb_writer.add_scalar("train/batch_time", batch_time_m.val, tb_step)
-                tb_writer.add_scalar("train/samples_per_second", samples_per_second, tb_step)
-                for key, value in loss_values.items():
-                    if key not in {"loss", "logit_scale"}:
-                        tb_writer.add_scalar(f"train/{key}", value, tb_step)
 
-        max_steps = getattr(args, "max_steps", None)
-        if max_steps is not None and optimizer_steps >= int(max_steps):
+            # Save train loss / etc. Using non avg meter values as loggers have their own smoothing
+            log_data = {
+                "data_time": data_time_m.val,
+                "batch_time": batch_time_m.val,
+                "samples_per_second": samples_per_second,
+                "samples_per_second_per_gpu": samples_per_second_per_gpu,
+                "scale": math.log(logit_scale_scalar),
+                "lr": optimizer.param_groups[0]["lr"]
+            }
+            log_data.update({name: val.val for name, val in losses_m.items()})
+            log_data = {"train/" + name: val for name, val in log_data.items()}
+
+            # resetting batch / data time meters per log window
+            batch_time_m.reset()
+            data_time_m.reset()
+
+        if reached_step_limit:
             break
-        end = time.perf_counter()
-    if diagnostics_enabled and is_master(args) and last_diagnostics:
-        import json
 
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        with summary_path.open("w", encoding="utf-8") as handle:
-            json.dump(last_diagnostics, handle, ensure_ascii=True, allow_nan=True, indent=2, sort_keys=True)
     return optimizer_steps
 
 

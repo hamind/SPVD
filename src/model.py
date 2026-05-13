@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -91,6 +93,20 @@ def get_cast_dtype(precision: str) -> torch.dtype | None:
     if precision == "fp16":
         return torch.float16
     return None
+
+def text_global_pool(x, text: Optional[torch.Tensor] = None, pool_type: str = 'argmax'):
+    if pool_type == 'first':
+        pooled, tokens = x[:, 0], x[:, 1:]
+    elif pool_type == 'last':
+        pooled, tokens = x[:, -1], x[:, :-1]
+    elif pool_type == 'argmax':
+        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        assert text is not None
+        pooled, tokens = x[torch.arange(x.shape[0]), text.argmax(dim=-1)], x
+    else:
+        pooled = tokens = x
+
+    return pooled, tokens
 
 
 def _build_vision_tower(
@@ -250,30 +266,35 @@ def apply_projection(x: Tensor, projection: Any) -> Tensor:
     return x @ projection
 
 
-class SlotAttentionBlock(nn.Module):
-    """Slot Attention update block over text token features."""
-
-    def __init__(self, embed_dim: int, num_heads: int = 4, dropout: float = 0.0, mlp_ratio: float = 4.0, eps: float = 1.0e-6) -> None:
+class TextCueEncoder(nn.Module):
+    def __init__(
+        self,
+        cue_num: int,
+        embed_dim: int,
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+    ):
         super().__init__()
-        if embed_dim % num_heads != 0:
-            raise ValueError("embed_dim must be divisible by num_heads.")
-        self.embed_dim = int(embed_dim)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.embed_dim // self.num_heads
-        self.scale = self.head_dim ** -0.5
-        self.eps = float(eps)
 
-        self.input_norm = nn.LayerNorm(embed_dim)
-        self.slot_norm = nn.LayerNorm(embed_dim)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.cue_num = cue_num
+        self.embed_dim = embed_dim
+
+        self.cue_embed = nn.Embedding(cue_num, embed_dim)
+
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.cue_norm = nn.LayerNorm(embed_dim)
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.gru = nn.GRUCell(embed_dim, embed_dim)
-        self.mlp_norm = nn.LayerNorm(embed_dim)
+
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
         hidden_dim = int(embed_dim * mlp_ratio)
-        self.mlp = nn.Sequential(
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -281,506 +302,254 @@ class SlotAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def _split_heads(self, value: Tensor, sequence_dim: int) -> Tensor:
-        batch_size = value.shape[0]
-        return value.reshape(batch_size, sequence_dim, self.num_heads, self.head_dim).transpose(1, 2)
+        self.out_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, slots: Tensor, text_tokens: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
-        """Update slots [B, S, D] from text_tokens [B, L, D] using slot-normalized attention."""
-        batch_size, num_slots, _ = slots.shape
-        num_tokens = text_tokens.shape[1]
-        norm_inputs = self.input_norm(text_tokens)
-        slots_prev = slots
-        norm_slots = self.slot_norm(slots)
+    def forward(
+        self,
+        text_token: torch.Tensor,
+        text_mask: torch.Tensor | None = None,
+        return_attn: bool = False,
+    ):
+        B, S, L, D = text_token.shape
+        assert D == self.embed_dim
 
-        q = self._split_heads(self.q_proj(norm_slots), num_slots)
-        k = self._split_heads(self.k_proj(norm_inputs), num_tokens)
-        v = self._split_heads(self.v_proj(norm_inputs), num_tokens)
+        x = self.token_norm(text_token)
 
-        logits = torch.einsum("bhld,bhsd->bhls", k, q) * self.scale
-        attn = torch.softmax(logits, dim=-1)
-        attn = attn + self.eps
-        if attention_mask is not None:
-            if attention_mask.shape != (batch_size, num_tokens):
-                raise ValueError(f"attention_mask must have shape {(batch_size, num_tokens)}, got {tuple(attention_mask.shape)}.")
-            valid = attention_mask.to(device=attn.device, dtype=attn.dtype).unsqueeze(1).unsqueeze(-1)
-            attn = attn * valid
-        attn = attn / attn.sum(dim=2, keepdim=True).clamp_min(self.eps)
-        attn = self.dropout(attn)
+        cue = self.cue_embed.weight[None, None, :, :].expand(B, S, -1, -1)
+        cue = self.cue_norm(cue)
 
-        updates = torch.einsum("bhls,bhld->bhsd", attn, v)
-        updates = updates.transpose(1, 2).reshape(batch_size, num_slots, self.embed_dim)
-        updates = self.out_proj(updates)
+        q = self.q_proj(cue)          # (B, S, C, D)
+        k = self.k_proj(x)            # (B, S, L, D)
+        v = self.v_proj(x)            # (B, S, L, D)
 
-        slots = self.gru(updates.reshape(-1, self.embed_dim), slots_prev.reshape(-1, self.embed_dim))
-        slots = slots.reshape(batch_size, num_slots, self.embed_dim)
-        slots = slots + self.mlp(self.mlp_norm(slots))
-        return slots
+        attn_logits = torch.einsum("b s c d, b s l d -> b s c l", q, k)
+        attn_logits = attn_logits / math.sqrt(D)
+
+        if text_mask is not None:
+            mask = text_mask[:, :, None, :].bool()  # (B, S, 1, L)
+            attn_logits = attn_logits.masked_fill(
+                ~mask,
+                torch.finfo(attn_logits.dtype).min,
+            )
+
+        attn = F.softmax(attn_logits, dim=-1)       # (B, S, C, L)
+        attn = self.attn_drop(attn)
+
+        cue_update = torch.einsum("b s c l, b s l d -> b s c d", attn, v)
+        cue_update = self.out_proj(cue_update)
+        cue_update = self.proj_drop(cue_update)
+
+        cue_out = self.cue_embed.weight[None, None, :, :].expand(B, S, -1, -1)
+        cue_out = cue_out + cue_update
+
+        cue_out = cue_out + self.ffn(self.ffn_norm(cue_out))
+        cue_out = self.out_norm(cue_out)
+
+        if return_attn:
+            return cue_out, attn
+
+        return cue_out
 
 
-class SoftCueExtractor(nn.Module):
-    """Extract fine-grained language soft cues from token features with Slot Attention."""
-
+class CueDecomposition(nn.Module):
     def __init__(
         self,
-        text_dim: int,
+        vision_dim: int,
         embed_dim: int,
-        num_soft_cues: int = 4,
-        num_heads: int = 4,
-        num_layers: int = 1,
+        n_head: int,
         dropout: float = 0.0,
-    ) -> None:
+        use_layernorm: bool = True,
+        normalize_output: bool = False,
+    ):
         super().__init__()
-        if num_soft_cues <= 0:
-            raise ValueError("num_soft_cues must be positive.")
-        if num_layers <= 0:
-            raise ValueError("num_layers must be positive.")
-        self.text_dim = int(text_dim)
-        self.embed_dim = int(embed_dim)
-        self.num_soft_cues = int(num_soft_cues)
-        self.text_proj = nn.Identity() if self.text_dim == self.embed_dim else nn.Linear(self.text_dim, self.embed_dim)
-        self.soft_cue_slots = nn.Parameter(torch.empty(self.num_soft_cues, self.embed_dim))
-        self.blocks = nn.ModuleList(
-            SlotAttentionBlock(self.embed_dim, num_heads=num_heads, dropout=dropout) for _ in range(num_layers)
+
+        assert embed_dim % n_head == 0
+
+        self.embed_dim = embed_dim
+        self.n_head = n_head
+        self.head_dim = embed_dim // n_head
+        self.normalize_output = normalize_output
+
+        if use_layernorm:
+            self.text_norm = nn.LayerNorm(embed_dim)
+            self.image_norm = nn.LayerNorm(vision_dim)
+        else:
+            self.text_norm = nn.Identity()
+            self.image_norm = nn.Identity()
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(vision_dim, embed_dim)
+        self.v_proj = nn.Linear(vision_dim, embed_dim)
+
+        self.semantic_proj = nn.Linear(embed_dim, embed_dim)
+        self.residual_proj = nn.Linear(embed_dim, embed_dim)
+
+        self.semantic_norm = nn.LayerNorm(embed_dim)
+        self.residual_norm = nn.LayerNorm(embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.logit_scale = nn.Parameter(torch.ones([]))
+        self.logit_bias = nn.Parameter(torch.zeros([]))
+
+    def forward(
+        self,
+        image_token: torch.Tensor,
+        text_cue: torch.Tensor,
+        return_map: bool = True,
+    ):
+        B, N, _ = image_token.shape
+        _, S, C, _ = text_cue.shape
+
+        H = self.n_head
+        Dh = self.head_dim
+
+        image_x = self.image_norm(image_token)
+        cue_x = self.text_norm(text_cue)
+
+        q = self.q_proj(cue_x).view(B, S, C, H, Dh)
+        k = self.k_proj(image_x).view(B, N, H, Dh)
+        v = self.v_proj(image_x).view(B, N, H, Dh)
+
+        logits = torch.einsum(
+            "b s c h d, b n h d -> b s c n h",
+            q,
+            k,
+        ) / math.sqrt(Dh)
+
+        scale = self.logit_scale.clamp(0.1, 10.0)
+        semantic_map = torch.sigmoid(logits * scale + self.logit_bias)
+        residual_map = 1.0 - semantic_map
+
+        semantic_cue = torch.einsum(
+            "b s c n h, b n h d -> b s c h d",
+            semantic_map,
+            v,
         )
-        self.out_norm = nn.LayerNorm(self.embed_dim)
-        self.reset_parameters()
 
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.soft_cue_slots, std=0.02)
+        residual_cue = torch.einsum(
+            "b s c n h, b n h d -> b s c h d",
+            residual_map,
+            v,
+        )
 
-    def forward(self, text_tokens: Tensor, attention_mask: Optional[Tensor] = None) -> Tensor:
-        """Return soft cues [B, S, D] from text tokens [B, L, D_t]."""
-        if text_tokens.ndim != 3:
-            raise ValueError(f"text_tokens must have shape [B, L, D], got {tuple(text_tokens.shape)}.")
-        if attention_mask is not None and attention_mask.shape != text_tokens.shape[:2]:
-            raise ValueError(f"attention_mask must have shape {tuple(text_tokens.shape[:2])}, got {tuple(attention_mask.shape)}.")
-        if isinstance(self.text_proj, nn.Linear):
-            text_tokens = text_tokens.to(dtype=self.text_proj.weight.dtype)
-        text_tokens = self.text_proj(text_tokens)
-        batch_size = text_tokens.shape[0]
-        slots = self.soft_cue_slots.unsqueeze(0).expand(batch_size, -1, -1)
-        slots = slots.to(device=text_tokens.device, dtype=text_tokens.dtype)
-        mask = attention_mask.to(device=text_tokens.device, dtype=torch.bool) if attention_mask is not None else None
-        for block in self.blocks:
-            slots = block(slots, text_tokens, attention_mask=mask)
-        return self.out_norm(slots)
+        sem_denom = semantic_map.sum(dim=3).unsqueeze(-1).clamp_min(1e-6)
+        res_denom = residual_map.sum(dim=3).unsqueeze(-1).clamp_min(1e-6)
 
+        semantic_cue = semantic_cue / sem_denom
+        residual_cue = residual_cue / res_denom
 
-class SoftCueSigmoidDecomposition(nn.Module):
-    """Text-conditioned visual decomposition with sigmoid-gated token pooling."""
+        semantic_cue = semantic_cue.contiguous().view(B, S, C, self.embed_dim)
+        residual_cue = residual_cue.contiguous().view(B, S, C, self.embed_dim)
 
-    def __init__(
-        self,
-        visual_dim: int,
-        embed_dim: int,
-        gate_temperature: float = 1.0,
-        gate_bias_init: float = 0.0,
-        eps: float = 1.0e-6,
-    ) -> None:
-        super().__init__()
-        if gate_temperature <= 0:
-            raise ValueError("gate_temperature must be positive.")
-        self.visual_dim = int(visual_dim)
-        self.embed_dim = int(embed_dim)
-        self.gate_temperature = float(gate_temperature)
-        self.eps = float(eps)
-        self.query_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.key_proj = nn.Linear(self.visual_dim, self.embed_dim)
-        self.semantic_value_proj = nn.Linear(self.visual_dim, self.embed_dim)
-        self.residual_value_proj = nn.Linear(self.visual_dim, self.embed_dim)
-        self.gate_bias = nn.Parameter(torch.tensor(float(gate_bias_init)))
-        self.out_semantic_norm = nn.LayerNorm(self.embed_dim)
-        self.out_residual_norm = nn.LayerNorm(self.embed_dim)
-        self.out_semantic_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_residual_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        semantic = self.semantic_norm(self.semantic_proj(semantic_cue).mean(dim=2))
+        residual = self.residual_norm(self.residual_proj(residual_cue).mean(dim=2))
 
-    def forward(self, visual_tokens: Tensor, soft_cues: Tensor) -> dict[str, Tensor]:
-        """Decompose visual tokens [B, M, D_v] using cues [B, S, D] or [B, K, S, D]."""
-        if soft_cues.ndim not in {3, 4}:
-            raise ValueError("soft_cues must have shape [B, S, D] or [B, K, S, D].")
-        single_caption = soft_cues.ndim == 3
-        if single_caption:
-            soft_cues = soft_cues.unsqueeze(1)
+        if return_map:
+            return semantic, residual, semantic_map, residual_map
 
-        visual_tokens = visual_tokens.to(dtype=self.key_proj.weight.dtype)
-        soft_cues = soft_cues.to(device=visual_tokens.device, dtype=self.query_proj.weight.dtype)
-
-        queries = self.query_proj(soft_cues)
-        keys = self.key_proj(visual_tokens)
-        semantic_values = self.semantic_value_proj(visual_tokens)
-        residual_values = self.residual_value_proj(visual_tokens)
-        scale = math.sqrt(float(self.embed_dim))
-
-        similarities = torch.einsum("bksd,bnd->bksn", queries, keys) / scale
-        gate_logits = (similarities + self.gate_bias.to(dtype=similarities.dtype)) / self.gate_temperature
-
-        sigmoid_map = torch.sigmoid(gate_logits)
-        residual_map = 1.0 - sigmoid_map
-
-        semantic_den = sigmoid_map.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-        residual_den = residual_map.sum(dim=-1, keepdim=True).clamp_min(self.eps)
-
-        cue_semantic = torch.einsum("bksn,bnd->bksd", sigmoid_map, semantic_values) / semantic_den
-        cue_residual = torch.einsum("bksn,bnd->bksd", residual_map, residual_values) / residual_den
-
-        semantic_features = cue_semantic.mean(dim=2)
-        residual_features = cue_residual.mean(dim=2)
-
-        semantic_features = self.out_semantic_proj(self.out_semantic_norm(semantic_features))
-        residual_features = self.out_residual_proj(self.out_residual_norm(residual_features))
-
-        if single_caption:
-            cue_semantic = cue_semantic.squeeze(1)
-            cue_residual = cue_residual.squeeze(1)
-            semantic_features = semantic_features.squeeze(1)
-            residual_features = residual_features.squeeze(1)
-            sigmoid_map = sigmoid_map.squeeze(1)
-            residual_map = residual_map.squeeze(1)
-            gate_logits = gate_logits.squeeze(1)
-
-        return {
-            "semantic_features": semantic_features,
-            "residual_features": residual_features,
-            "sigmoid_map": sigmoid_map,
-            "residual_map": residual_map,
-            "gate_logits": gate_logits,
-        }
+        return semantic, residual
 
 
-class SPVDModel(nn.Module):
-    """SPVD bi-encoder with an optional soft-cue decomposition branch."""
-
-    output_dict: torch.jit.Final[bool]
+class SPVD(nn.Module):
+    """SPVD model class."""
 
     def __init__(
         self,
         embed_dim: int,
-        vision_cfg: dict[str, Any],
-        text_cfg: dict[str, Any],
-        spvd_cfg: dict[str, Any] | None = None,
+        vision_cfg: CLIPVisionCfg | dict[str, Any],
+        text_cfg: CLIPTextCfg | dict[str, Any],
         quick_gelu: bool = False,
         init_logit_scale: float = np.log(1 / 0.07),
-        init_logit_bias: float | None = None,
-        nonscalar_logit_scale: bool = False,
+        init_logit_bias: Optional[float] = None,
         cast_dtype: torch.dtype | None = None,
-        output_dict: bool = False,
+        cue_num: int = 4,
+        spvd_cfg: dict[str, Any] | None = None,
+        output_dict: bool | None = None,
+        **_: Any,
     ) -> None:
         super().__init__()
-        cfg = spvd_cfg or {}
-        vision_cfg = dict(vision_cfg)
-        vision_cfg["output_tokens"] = True
-
-        self.output_dict = bool(output_dict)
-        self.embed_dim = int(embed_dim)
+        spvd_cfg = spvd_cfg or {}
+        cue_num = int(spvd_cfg.get("num_soft_cues", cue_num))
+        if isinstance(vision_cfg, dict):
+            vision_cfg = dict(vision_cfg)
+            vision_cfg["output_tokens"] = True
+        else:
+            vision_cfg.output_tokens = True
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
-
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+
         self.transformer = text.transformer
         self.context_length = text.context_length
         self.vocab_size = text.vocab_size
         self.token_embedding = text.token_embedding
         self.positional_embedding = text.positional_embedding
         self.ln_final = text.ln_final
-        self.text_projection = text.text_projection
         self.text_pool_type = text.pool_type
-        self.text_eos_id = getattr(text, "eos_id", None)
-        self.text_pad_id = int(getattr(text, "pad_id", 0))
-        self.register_buffer("attn_mask", text.attn_mask, persistent=False)
+        self.register_buffer('attn_mask', text.attn_mask, persistent=False)
 
-        lshape = [1] if nonscalar_logit_scale else []
-        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
         if init_logit_bias is not None:
-            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+            self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
         else:
             self.logit_bias = None
 
-        self.return_patch_tokens = bool(cfg.get("return_patch_tokens", True))
-        self.use_global_image_head = bool(cfg.get("use_global_image_head", True))
-        self.normalize_outputs = bool(cfg.get("normalize_outputs", cfg.get("normalize", True)))
-        self.visual_dim = self._infer_visual_token_dim()
-        self.text_dim = int(self.token_embedding.embedding_dim)
-        self.embed_dim = int(embed_dim)
+        self.scale = text.width ** -0.5
+        self.text_projection = nn.Parameter(self.scale * torch.randn(text.width, embed_dim))
 
-        self.use_finegrained_text_cue = bool(cfg.get("use_finegrained_text_cue", True))
-        self.text_cue_type = str(cfg.get("text_cue_type", "soft_cue")).lower()
-        self.enable_soft_cue_decomp = bool(cfg.get("enable_soft_cue_decomp", False))
-        self.uses_soft_cue_extractor = self.use_finegrained_text_cue and self.text_cue_type not in {"pooled", "eot", "global"}
-        if self.enable_soft_cue_decomp:
-            self._freeze_unused_visual_projection()
-            if self.uses_soft_cue_extractor:
-                self.soft_cue_extractor = SoftCueExtractor(
-                    text_dim=self.text_dim,
-                    embed_dim=self.embed_dim,
-                    num_soft_cues=int(cfg.get("num_soft_cues", 4)),
-                    num_heads=int(cfg.get("soft_cue_num_heads", 4)),
-                    num_layers=int(cfg.get("soft_cue_num_layers", 1)),
-                    dropout=float(cfg.get("soft_cue_dropout", 0.0)),
-                )
-            self.soft_cue_decomposition = SoftCueSigmoidDecomposition(
-                visual_dim=self.visual_dim,
-                embed_dim=self.embed_dim,
-                gate_temperature=float(cfg.get("gate_temperature", cfg.get("routing_temperature", 1.0))),
-                gate_bias_init=float(cfg.get("gate_bias_init", 0.0)),
-            )
+        self.cue_encoder = TextCueEncoder(cue_num=cue_num, embed_dim=embed_dim)
+        self.decom = CueDecomposition(vision_dim=vision_cfg['width'], embed_dim=embed_dim, n_head=text_cfg['heads'])
 
-    def _freeze_unused_visual_projection(self) -> None:
-        """Freeze the global visual projection when SPVD only trains token routes."""
-        visual_projection = getattr(self.visual, "proj", None)
-        if isinstance(visual_projection, nn.Parameter):
-            visual_projection.requires_grad_(False)
-        elif isinstance(visual_projection, nn.Module):
-            for parameter in visual_projection.parameters():
-                parameter.requires_grad_(False)
+    def encode_image(self, image: Tensor) -> Tensor:
+        image_embedding, image_token = self.visual(image)
 
-    def lock_image_tower(self, unlocked_groups: int = 0, freeze_bn_stats: bool = False) -> None:
-        """OpenCLIP-compatible image tower freezing hook."""
-        lock = getattr(self.visual, "lock", None)
-        if callable(lock):
-            lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
+        return image_embedding, image_token
 
-    @torch.jit.ignore
-    def set_grad_checkpointing(self, enable: bool = True) -> None:
-        """Enable checkpointing on towers that expose the OpenCLIP hook."""
-        visual_setter = getattr(self.visual, "set_grad_checkpointing", None)
-        if callable(visual_setter):
-            visual_setter(enable)
-        if hasattr(self.transformer, "grad_checkpointing"):
-            self.transformer.grad_checkpointing = enable
 
-    def _infer_visual_token_dim(self) -> int:
-        """Infer the local visual-token width from the OpenCLIP visual tower."""
-        class_embedding = getattr(self.visual, "class_embedding", None)
-        if class_embedding is not None:
-            return int(class_embedding.shape[-1])
-        conv1 = getattr(self.visual, "conv1", None)
-        if conv1 is not None:
-            return int(conv1.out_channels)
-        raise AttributeError("Unable to infer OpenCLIP visual token width.")
+    def encode_text(self, text: Tensor) -> Tensor:
+        if text.ndim == 2:
+            text = text.unsqueeze(1)
+        if text.ndim != 3:
+            raise ValueError(f"text must have shape [B, L] or [B, K, L], got {tuple(text.shape)}")
+        B, K, L = text.shape
+        cast_dtype = self.transformer.get_cast_dtype()
 
-    def _text_cast_dtype(self) -> torch.dtype:
-        get_cast_dtype = getattr(self.transformer, "get_cast_dtype", None)
-        if callable(get_cast_dtype):
-            return get_cast_dtype()
-        return self.token_embedding.weight.dtype
+        text = text.view(-1, L)  # (B*K, 77)
 
-    def _text_attn_mask(self, length: int, device: torch.device) -> Tensor | None:
-        attn_mask = getattr(self, "attn_mask", None)
-        if attn_mask is None:
-            return None
-        return attn_mask[:length, :length].to(device=device)
+        x = self.token_embedding(text).to(cast_dtype)
+        D = x.shape[-1]
 
-    def encode_image(
-        self,
-        image: Tensor,
-        normalize: bool = False,
-        return_tokens: bool = False,
-        return_patch_tokens: bool | None = None,
-    ) -> Tensor | dict[str, Tensor | None]:
-        """OpenCLIP-style image encoding with optional local visual tokens.
+        x = x + self.positional_embedding.to(cast_dtype)
+        x = self.transformer(x, attn_mask=self.attn_mask)
+        x = self.ln_final(x)
+        text_embedding, text_tokens = text_global_pool(x, text, self.text_pool_type)
 
-        The visual tower itself returns the pooled image representation and local
-        image tokens; this method only decides whether to expose the token path.
-        """
-        if return_patch_tokens is not None:
-            return_tokens = bool(return_patch_tokens)
-        visual_outputs = self.visual(image)
-        if isinstance(visual_outputs, tuple):
-            image_global, image_tokens = visual_outputs
-        else:
-            image_global, image_tokens = visual_outputs, None
+        text_mask = text.ne(0).reshape(B, K, L)
+        text_tokens = text_tokens.view(B, K, L, D)
+        text_cue = self.cue_encoder(text_tokens, text_mask)
 
-        if normalize and image_global is not None:
-            image_global = F.normalize(image_global, dim=-1)
-        if not return_tokens:
-            return image_global
-        if image_tokens is None:
-            raise RuntimeError("OpenCLIP visual tower did not return local image tokens.")
-        return {
-            "image_global": image_global if self.use_global_image_head else None,
-            "image_tokens": image_tokens,
-        }
+        text_embedding = text_embedding @ self.text_projection
+        text_cue = text_cue @ self.text_projection
 
-    def encode_text(
-        self,
-        text: Tensor,
-        normalize: bool = False,
-        return_tokens: bool = False,
-    ) -> Tensor | dict[str, Tensor]:
-        """OpenCLIP-style text encoding with optional multi-caption input.
+        return text_embedding.view(B, K, D), text_cue.view(B, K, -1, D)
 
-        Text may be shaped [B, L] or [B, K, L]. Multi-caption
-        inputs are flattened to [B*K, L] for the text tower, then pooled
-        back to one text feature per image while exposing all caption tokens to
-        the SPVD cue extractor.
-        """
-        if text.ndim not in {2, 3}:
-            raise ValueError(f"Text must have shape [B, L] or [B, K, L], got {tuple(text.shape)}.")
+    def forward(self, image, text):
+        _, image_token = self.encode_image(image)
+        text_embedding, text_cue = self.encode_text(text)
 
-        multi_caption = text.ndim == 3
-        if multi_caption:
-            batch_size, captions_per_sample, context_length = text.shape
-            text_for_encoder = text.reshape(batch_size * captions_per_sample, context_length)
-        else:
-            batch_size, context_length = text.shape
-            captions_per_sample = 1
-            text_for_encoder = text
+        semantic, residual, semantic_map, _ = self.decom(image_token, text_cue)
 
-        if context_length > int(self.positional_embedding.shape[0]):
-            raise ValueError(f"Text length {context_length} exceeds context length {int(self.positional_embedding.shape[0])}.")
-        text_attention_mask = text_for_encoder.ne(self.text_pad_id)
-
-        cast_dtype = self._text_cast_dtype()
-        x = self.token_embedding(text_for_encoder).to(cast_dtype)
-        x = x + self.positional_embedding[:context_length].to(device=x.device, dtype=cast_dtype)
-        text_tokens = self.transformer(x, attn_mask=self._text_attn_mask(context_length, x.device))
-        text_tokens = self.ln_final(text_tokens)
-
-        text_global = text_global_pool(
-            text_tokens,
-            text_for_encoder,
-            self.text_pool_type,
-            eos_token_id=getattr(self, "text_eos_id", None),
-        )
-        text_global = apply_projection(text_global, self.text_projection)
-
-        if multi_caption:
-            text_tokens = text_tokens.reshape(batch_size, captions_per_sample, context_length, text_tokens.shape[-1])
-            text_global = text_global.reshape(batch_size, captions_per_sample, -1)
-            text_attention_mask = text_attention_mask.reshape(batch_size, captions_per_sample, context_length)
-        if normalize:
-            text_global = F.normalize(text_global, dim=-1)
-
-        if not return_tokens:
-            return text_global
-
-        outputs = {
-            "text_global": text_global,
-            "text_tokens": text_tokens,
-            "text_attention_mask": text_attention_mask,
-        }
-        if self.enable_soft_cue_decomp:
-            if self.uses_soft_cue_extractor:
-                if text_tokens.ndim == 4:
-                    batch_size, captions_per_sample, context_length, token_dim = text_tokens.shape
-                    flat_text_tokens = text_tokens.reshape(batch_size * captions_per_sample, context_length, token_dim)
-                    flat_attention_mask = text_attention_mask.reshape(batch_size * captions_per_sample, context_length)
-                    flat_cue = self.soft_cue_extractor(flat_text_tokens, attention_mask=flat_attention_mask)
-                    cue = flat_cue.reshape(batch_size, captions_per_sample, flat_cue.shape[1], flat_cue.shape[2])
-                else:
-                    cue = self.soft_cue_extractor(text_tokens, attention_mask=text_attention_mask)
-            else:
-                if text_global.ndim == 3:
-                    cue = text_global.unsqueeze(2).to(dtype=text_tokens.dtype)
-                else:
-                    cue = text_global.unsqueeze(1).to(dtype=text_tokens.dtype)
-            outputs["cue"] = cue
-            outputs["soft_cues"] = cue
-        return outputs
-
-    def get_logits_as_clip(self, image: Tensor, text: Tensor) -> tuple[Tensor, Tensor]:
-        """Return global CLIP-style logits."""
-        image_features = self.encode_image(image, normalize=True)
-        text_features = self.encode_text(text, normalize=True)
-        if not torch.is_tensor(image_features) or not torch.is_tensor(text_features):
-            raise RuntimeError("Global CLIP logits require tensor image and text features.")
-        if text_features.ndim == 3:
-            text_features = F.normalize(text_features.mean(dim=1), dim=-1)
-        image_logits = self.logit_scale.exp() * image_features @ text_features.t()
-        if self.logit_bias is not None:
-            image_logits = image_logits + self.logit_bias
-        return image_logits, image_logits.t()
-
-    def get_logits(self, image: Tensor, text: Tensor) -> tuple[Tensor, Tensor]:
-        """Expose the standard global scoring path for interface compatibility."""
-        return self.get_logits_as_clip(image, text)
-
-    def _maybe_normalize(self, value: Tensor | None) -> Tensor | None:
-        if value is None or not self.normalize_outputs:
-            return value
-        return F.normalize(value, dim=-1)
-
-    def forward_spvd(self, image: Tensor, text: Tensor) -> dict[str, Any]:
-        """Return CLIP-style features, with optional soft-cue decomposition."""
-        if not self.enable_soft_cue_decomp:
-            image_features = self.encode_image(image, normalize=self.normalize_outputs)
-            text_features = self.encode_text(text, normalize=self.normalize_outputs)
-            if not torch.is_tensor(image_features) or not torch.is_tensor(text_features):
-                raise RuntimeError("Baseline SPVD forward requires tensor image and text features.")
-            if text_features.ndim == 3:
-                text_features = F.normalize(text_features.mean(dim=1), dim=-1) if self.normalize_outputs else text_features.mean(dim=1)
-            outputs: dict[str, Any] = {
-                "image_features": image_features,
-                "text_features": text_features,
-                "logit_scale": self.logit_scale.exp(),
-            }
-            if self.logit_bias is not None:
-                outputs["logit_bias"] = self.logit_bias
-            return outputs
-
-        image_outputs = self.encode_image(image, normalize=False, return_tokens=True)
-        text_outputs = self.encode_text(text, normalize=self.normalize_outputs, return_tokens=True)
-        image_tokens = image_outputs["image_tokens"]
-        image_global = image_outputs["image_global"]
-        text_tokens = text_outputs["text_tokens"]
-        text_global = text_outputs["text_global"]
-        soft_cues = text_outputs.get("cue")
-        if soft_cues is None:
-            soft_cues = text_outputs.get("soft_cues")
-        if soft_cues is None:
-            raise RuntimeError("encode_text must return cue when soft-cue decomposition is enabled.")
-        if image_tokens is None:
-            raise RuntimeError("Visual encoder did not return patch tokens.")
-
-        caption_text_features = text_global if text_global.ndim == 3 else None
-        if text_global.ndim == 3:
-            text_features = F.normalize(text_global.mean(dim=1), dim=-1) if self.normalize_outputs else text_global.mean(dim=1)
-        else:
-            text_features = text_global
-
-        decomp_outputs = self.soft_cue_decomposition(image_tokens, soft_cues)
-        shared_global = decomp_outputs["semantic_features"]
-        residual_global = decomp_outputs["residual_features"]
-        outputs = {
-            "image_features": shared_global,
-            "text_features": text_features,
+        out_dict = {
+            "semantic": semantic,
+            "residual": residual,
+            "text_features": text_embedding,
+            "semantic_map": semantic_map.mean(-1),
             "logit_scale": self.logit_scale.exp(),
-            "shared_visual_features": shared_global,
-            "residual_visual_features": residual_global,
-            "caption_text_features": caption_text_features,
-            "sigmoid_map": decomp_outputs["sigmoid_map"],
-            "residual_map": decomp_outputs["residual_map"],
-            "gate_logits": decomp_outputs["gate_logits"],
         }
-        if self.logit_bias is not None:
-            outputs["logit_bias"] = self.logit_bias
-        return outputs
 
-    def forward(
-        self,
-        image: Tensor | None = None,
-        text: Tensor | None = None,
-        output_dict: bool | None = None,
-    ) -> dict[str, Any] | tuple[Tensor | None, Tensor | None, Tensor]:
-        """OpenCLIP-compatible forward with an SPVD dictionary extension."""
-        use_dict = self.output_dict if output_dict is None else bool(output_dict)
-        if image is None or text is None:
-            image_features = self.encode_image(image, normalize=True) if image is not None else None
-            text_features = self.encode_text(text, normalize=True) if text is not None else None
-            if use_dict:
-                out: dict[str, Any] = {
-                    "image_features": image_features,
-                    "text_features": text_features,
-                    "logit_scale": self.logit_scale.exp(),
-                }
-                if self.logit_bias is not None:
-                    out["logit_bias"] = self.logit_bias
-                return out
-            return image_features, text_features, self.logit_scale.exp()
-
-        outputs = self.forward_spvd(image, text)
-        if use_dict:
-            return outputs
         if self.logit_bias is not None:
-            return outputs["image_features"], outputs["text_features"], outputs["logit_scale"], self.logit_bias
-        return outputs["image_features"], outputs["text_features"], outputs["logit_scale"]
+            out_dict['logit_bias'] = self.logit_bias
+        return out_dict
+
+
+SPVDModel = SPVD
