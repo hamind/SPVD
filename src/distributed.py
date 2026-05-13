@@ -77,5 +77,10 @@ def cleanup_distributed() -> None:
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return underlying module for DDP-wrapped models."""
-    return model.module if hasattr(model, "module") else model
+    """Return the original model under DDP and torch.compile wrappers."""
+    module = model
+    while hasattr(module, "module"):
+        module = module.module
+    while hasattr(module, "_orig_mod"):
+        module = module._orig_mod
+    return module

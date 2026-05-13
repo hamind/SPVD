@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import json
+import importlib
 from pathlib import Path
 from typing import Sequence
 
@@ -45,6 +46,44 @@ def _optimizer_to_device(optimizer: torch.optim.Optimizer, device: torch.device)
         for name, value in state.items():
             if torch.is_tensor(value):
                 state[name] = value.to(device)
+
+
+def _maybe_compile_model(model: torch.nn.Module, args: object, logger: object) -> torch.nn.Module:
+    """Optionally compile the model before DDP wrapping."""
+    if not bool(getattr(args, "torch_compile", False)):
+        return model
+
+    if not hasattr(torch, "compile"):
+        logger.warning("torch.compile is not available in this PyTorch version; continuing without compile.")
+        return model
+
+    if bool(getattr(args, "debug_finite_checks", False)):
+        logger.warning(
+            "torch.compile is enabled while debug_finite_checks=True. "
+            "This may reduce compile benefit; consider setting training.debug_finite_checks=false."
+        )
+
+    try:
+        dynamo = importlib.import_module("torch._dynamo")
+        dynamo.config.suppress_errors = bool(getattr(args, "torch_compile_disable_errors", True))
+    except Exception as exc:
+        logger.warning("failed to configure torch._dynamo suppress_errors: %s", exc)
+
+    logger.info(
+        "compiling model with torch.compile backend=%s mode=%s fullgraph=%s dynamic=%s",
+        getattr(args, "torch_compile_backend", "inductor"),
+        getattr(args, "torch_compile_mode", "reduce-overhead"),
+        bool(getattr(args, "torch_compile_fullgraph", False)),
+        bool(getattr(args, "torch_compile_dynamic", False)),
+    )
+
+    return torch.compile(
+        model,
+        backend=getattr(args, "torch_compile_backend", "inductor"),
+        mode=getattr(args, "torch_compile_mode", "reduce-overhead"),
+        fullgraph=bool(getattr(args, "torch_compile_fullgraph", False)),
+        dynamic=bool(getattr(args, "torch_compile_dynamic", False)),
+    )
 
 
 def _resolved_config(args: object) -> dict[str, object]:
@@ -125,6 +164,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             resume_epoch = int(resume_payload.get("epoch", 0) or 0)
             resume_step = int(resume_payload.get("step", 0) or 0)
             logger.info("loaded checkpoint model state: %s (epoch=%d, step=%d)", args.resume, resume_epoch, resume_step)
+
+        model = _maybe_compile_model(model, args, logger)
 
         if args.distributed:
             model = DistributedDataParallel(model, device_ids=[args.local_rank] if args.device.type == "cuda" else None)

@@ -1,7 +1,8 @@
-﻿"""Training and feature-extraction loops."""
+"""Training and feature-extraction loops."""
 
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from pathlib import Path
@@ -21,7 +22,7 @@ from diagnostics import (
     snapshot_params_for_update,
     write_jsonl,
 )
-from distributed import is_master
+from distributed import is_master, unwrap_model
 
 
 class AverageMeter:
@@ -43,10 +44,6 @@ class AverageMeter:
         self.avg = self.sum / max(self.count, 1)
 
 
-def unwrap_model(model: nn.Module) -> nn.Module:
-    """Return the underlying module when wrapped by DDP-like containers."""
-    return model.module if hasattr(model, "module") else model
-
 
 def backward(total_loss: torch.Tensor, scaler: GradScaler | None) -> None:
     """Backpropagate with optional gradient scaling."""
@@ -54,6 +51,46 @@ def backward(total_loss: torch.Tensor, scaler: GradScaler | None) -> None:
         scaler.scale(total_loss).backward()
     else:
         total_loss.backward()
+
+
+def clamp_logit_scale_(model: nn.Module, min_scale: float, max_scale: float) -> bool:
+    """Clamp a model logit_scale parameter whose stored value is log-space."""
+    raw_model = unwrap_model(model)
+    if not hasattr(raw_model, "logit_scale"):
+        return False
+    min_scale = float(min_scale)
+    max_scale = float(max_scale)
+    if min_scale <= 0 or max_scale <= 0 or max_scale < min_scale:
+        raise ValueError(f"Invalid logit scale clamp range: min_scale={min_scale}, max_scale={max_scale}")
+    with torch.no_grad():
+        raw_model.logit_scale.clamp_(math.log(min_scale), math.log(max_scale))
+    return True
+
+
+def clip_gradients_(model: nn.Module, grad_clip_norm: float | None) -> bool:
+    """Optionally clip gradients and report whether clipping was requested."""
+    if grad_clip_norm is None or float(grad_clip_norm) <= 0:
+        return False
+    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip_norm), norm_type=2.0)
+    return True
+
+
+def _model_logit_stats(model: nn.Module, eps: float = 1.0e-12) -> dict[str, float]:
+    """Read post-step logit scale/bias values from the unwrapped model."""
+    raw_model = unwrap_model(model)
+    stats: dict[str, float] = {}
+    logit_scale = getattr(raw_model, "logit_scale", None)
+    if torch.is_tensor(logit_scale) and logit_scale.numel() == 1:
+        log_scale = float(logit_scale.detach().float().cpu())
+        scale = math.exp(log_scale)
+        stats["train/logit_scale_exp"] = scale
+        stats["train/logit_scale_log"] = log_scale
+        stats["train/logit_scale"] = scale
+        stats["train/temperature"] = 1.0 / max(scale, eps)
+    logit_bias = getattr(raw_model, "logit_bias", None)
+    if torch.is_tensor(logit_bias) and logit_bias.numel() == 1:
+        stats["train/logit_bias"] = float(logit_bias.detach().float().cpu())
+    return stats
 
 
 def _autocast(args: object):
@@ -118,6 +155,36 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
         "loss_sigmoid": "loss_align",
         "loss_align_global": "loss_align_global",
         "loss_align_caption": "loss_align_caption",
+        "global_align_enabled": "global_align_enabled",
+        "caption_align_enabled": "caption_align_enabled",
+        "caption_primary_loss": "caption_primary_loss",
+        "caption_pos_loss": "caption_pos_loss",
+        "caption_neg_loss": "caption_neg_loss",
+        "caption_margin_sim": "caption_margin_sim",
+        "caption_margin_logit": "caption_margin_logit",
+        "caption_valid_negative_fraction": "caption_valid_negative_fraction",
+        "caption_masked_same_image_pairs": "caption_masked_same_image_pairs",
+        "caption_num_masked_same_image_pairs": "caption_num_masked_same_image_pairs",
+        "caption_num_positive_pairs": "caption_num_positive_pairs",
+        "caption_num_negative_pairs": "caption_num_negative_pairs",
+        "caption_num_pairs": "caption_num_pairs",
+        "caption_num_total_pairs": "caption_num_total_pairs",
+        "caption_num_valid_pairs": "caption_num_valid_pairs",
+        "caption_region_positive_loss": "caption_region_positive_loss",
+        "caption_region_negative_loss": "caption_region_negative_loss",
+        "caption_region_same_image_loss": "caption_region_same_image_loss",
+        "caption_region_positive_active_fraction": "caption_region_positive_active_fraction",
+        "caption_region_negative_active_fraction": "caption_region_negative_active_fraction",
+        "caption_region_positive_weight_sum": "caption_region_positive_weight_sum",
+        "caption_region_negative_weight_sum": "caption_region_negative_weight_sum",
+        "caption_region_overlap_mean": "caption_region_overlap_mean",
+        "caption_region_overlap_min": "caption_region_overlap_min",
+        "caption_region_overlap_max": "caption_region_overlap_max",
+        "caption_region_overlap_std": "caption_region_overlap_std",
+        "caption_region_pos_weight_effective": "caption_region_pos_weight_effective",
+        "caption_region_neg_weight_effective": "caption_region_neg_weight_effective",
+        "caption_region_warmup_alpha": "caption_region_warmup_alpha",
+        "caption_same_image_mode_code": "caption_same_image_mode_code",
         "loss_branch": "loss_branch",
         "loss_branch_s_text": "loss_branch_s_text",
         "loss_branch_r_text": "loss_branch_r_text",
@@ -125,6 +192,11 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
         "branch_sim_r_text": "branch_sim_r_text",
         "branch_gap_s_minus_r": "branch_gap_s_minus_r",
         "loss_residual_variance": "loss_residual_variance",
+        "loss_branch_weight_effective": "loss_branch_weight_effective",
+        "loss_residual_variance_weight_effective": "loss_residual_variance_weight_effective",
+        "logit_scale_exp": "logit_scale_exp",
+        "logit_scale_log": "logit_scale_log",
+        "logit_bias": "logit_bias",
         "gate_mean": "gate_mean",
         "gate_std": "gate_std",
         "gate_min": "gate_min",
@@ -208,13 +280,19 @@ def train_one_epoch(
     optimizer_steps = 0
     recent_clip_flags: deque[bool] = deque(maxlen=100)
     last_diagnostics: dict[str, float] = {}
+    grad_clip_norm = getattr(args, "grad_clip_norm", None)
+    if grad_clip_norm is not None:
+        grad_clip_norm = float(grad_clip_norm)
 
     for step, batch in enumerate(data_loader, start=1):
         data_time_m.update(time.perf_counter() - end)
         images = batch["image"].to(device, non_blocking=True)
         texts = batch["text"].to(device, non_blocking=True)
+        current_global_step = global_step_offset + optimizer_steps
         if scheduler is not None:
-            scheduler(global_step_offset + optimizer_steps)
+            scheduler(current_global_step)
+        if hasattr(loss_fn, "set_global_step"):
+            loss_fn.set_global_step(current_global_step)
         with _autocast(args):
             outputs = model(images, texts)
             raw_loss, loss_dict = _compute_loss(loss_fn, outputs, args, device)
@@ -226,12 +304,21 @@ def train_one_epoch(
             next_optimizer_step = global_step_offset + optimizer_steps + 1
             should_log_diag = diagnostics_enabled and next_optimizer_step % diag_log_interval == 0
             should_log_heavy = diagnostics_enabled and next_optimizer_step % heavy_log_interval == 0
-            if scaler is not None and scaler.is_enabled() and (should_log_diag or should_log_heavy):
+            needs_unscale = (
+                scaler is not None
+                and scaler.is_enabled()
+                and ((grad_clip_norm is not None and grad_clip_norm > 0) or should_log_diag or should_log_heavy)
+            )
+            if needs_unscale:
                 scaler.unscale_(optimizer)
             grad_stats = compute_global_param_stats(model, distributed=bool(getattr(args, "distributed", False)), eps=diag_eps) if should_log_diag else {}
             grad_norm_before_clip = grad_stats.get("grad_norm")
-            grad_norm_after_clip = grad_norm_before_clip
-            clip_applied = False
+            clip_applied = clip_gradients_(model, grad_clip_norm)
+            if should_log_diag and clip_applied:
+                grad_stats_after_clip = compute_global_param_stats(model, distributed=bool(getattr(args, "distributed", False)), eps=diag_eps)
+                grad_norm_after_clip = grad_stats_after_clip.get("grad_norm")
+            else:
+                grad_norm_after_clip = grad_norm_before_clip
             recent_clip_flags.append(clip_applied)
             update_snapshot = None
             if should_log_diag and log_update_rms:
@@ -239,6 +326,13 @@ def train_one_epoch(
             old_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
+            logit_scale_clamped = False
+            if bool(getattr(args, "clamp_logit_scale", False)):
+                logit_scale_clamped = clamp_logit_scale_(
+                    model,
+                    float(getattr(args, "min_logit_scale", 1.0)),
+                    float(getattr(args, "max_logit_scale", 100.0)),
+                )
             new_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else old_scale
             optimizer_step_skipped = bool(old_scale is not None and new_scale is not None and new_scale < old_scale)
             update_stats: dict[str, float] = {}
@@ -269,12 +363,15 @@ def train_one_epoch(
                     "train/grad_norm_after_clip": float(grad_norm_after_clip or 0.0),
                     "train/clip_applied": float(clip_applied),
                     "train/clip_fraction": sum(recent_clip_flags) / max(len(recent_clip_flags), 1),
+                    "train/logit_scale_clamped": float(logit_scale_clamped),
                     "train/optimizer_step_skipped": float(optimizer_step_skipped),
                 }
                 metrics.update(_prefixed_loss_values(loss_dict, loss.detach() * accum_freq))
                 metrics.update({f"train/{key}": value for key, value in grad_stats.items()})
                 metrics.update({f"train/{key}": value for key, value in update_stats.items()})
                 metrics.update(compute_logits_stats(outputs, eps=diag_eps))
+                metrics.update(_model_logit_stats(model, eps=diag_eps))
+                metrics["train/logit_scale_clamped"] = float(logit_scale_clamped)
                 if should_log_heavy:
                     features = collect_feature_tensors(outputs)
                     if log_effective_rank:
@@ -312,11 +409,49 @@ def train_one_epoch(
             samples_per_second = samples_seen / elapsed
             batch_time_m.update(time.perf_counter() - end)
             loss_values = _loss_dict_to_floats(loss_dict)
+            loss_values.update({key.removeprefix("train/"): value for key, value in _model_logit_stats(model, eps=diag_eps).items()})
+            loss_values["logit_scale_clamped"] = float(logit_scale_clamped)
+            loss_values["clip_applied"] = float(clip_applied)
+            loss_values["clip_fraction"] = sum(recent_clip_flags) / max(len(recent_clip_flags), 1)
             aux_keys = (
                 "loss_align",
                 "loss_sigmoid",
                 "loss_align_global",
                 "loss_align_caption",
+                "global_align_enabled",
+                "caption_align_enabled",
+                "caption_primary_loss",
+                "caption_pos_loss",
+                "caption_neg_loss",
+                "caption_margin_sim",
+                "caption_margin_logit",
+                "caption_valid_negative_fraction",
+                "caption_masked_same_image_pairs",
+                "caption_num_masked_same_image_pairs",
+                "caption_num_positive_pairs",
+                "caption_num_negative_pairs",
+                "caption_num_pairs",
+                "caption_num_total_pairs",
+                "caption_num_valid_pairs",
+                "caption_region_positive_loss",
+                "caption_region_negative_loss",
+                "caption_region_same_image_loss",
+                "caption_region_positive_active_fraction",
+                "caption_region_negative_active_fraction",
+                "caption_region_positive_weight_sum",
+                "caption_region_negative_weight_sum",
+                "caption_region_overlap_mean",
+                "caption_region_overlap_min",
+                "caption_region_overlap_max",
+                "caption_region_overlap_std",
+                "caption_region_pos_weight_effective",
+                "caption_region_neg_weight_effective",
+                "caption_region_warmup_alpha",
+                "caption_same_image_mode_code",
+                "logit_scale_exp",
+                "logit_scale_log",
+                "logit_bias",
+                "logit_scale_clamped",
                 "loss_branch",
                 "loss_branch_s_text",
                 "loss_branch_r_text",
@@ -324,6 +459,10 @@ def train_one_epoch(
                 "branch_sim_r_text",
                 "branch_gap_s_minus_r",
                 "loss_residual_variance",
+                "loss_branch_weight_effective",
+                "loss_residual_variance_weight_effective",
+                "clip_applied",
+                "clip_fraction",
                 "gate_mean",
                 "gate_std",
                 "gate_min",
@@ -360,7 +499,7 @@ def train_one_epoch(
                         tb_writer.add_scalar(f"train/{key}", value, tb_step)
 
         max_steps = getattr(args, "max_steps", None)
-        if max_steps is not None and optimizer_steps >= int(max_steps):
+        if max_steps is not None and (global_step_offset + optimizer_steps) >= int(max_steps):
             break
         end = time.perf_counter()
     if diagnostics_enabled and is_master(args) and last_diagnostics:

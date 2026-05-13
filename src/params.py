@@ -154,12 +154,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--align-weight", type=float, default=_default_loss_value(config, "align_weight", 1.0))
     parser.add_argument("--global-align-weight", type=float, default=_default_loss_value(config, "global_align_weight", 1.0))
     parser.add_argument("--caption-align-weight", type=float, default=_default_loss_value(config, "caption_align_weight", 1.0))
+    parser.add_argument("--caption-loss-impl", default=_default_loss_value(config, "caption_loss_impl", "masked_sigmoid"), choices=["masked_sigmoid", "openclip_siglip"])
+    parser.add_argument("--caption-mask-same-image", action=argparse.BooleanOptionalAction, default=bool(_default_loss_value(config, "caption_mask_same_image", True)))
+    parser.add_argument("--caption-same-image-mode", default=_default_loss_value(config, "caption_same_image_mode", "ignore"), choices=["ignore", "region_soft_positive", "region_soft_signed"])
+    parser.add_argument("--caption-region-pos-weight", type=float, default=_default_loss_value(config, "caption_region_pos_weight", 0.05))
+    parser.add_argument("--caption-region-neg-weight", type=float, default=_default_loss_value(config, "caption_region_neg_weight", 0.02))
+    parser.add_argument("--caption-region-start-weight", type=float, default=_default_loss_value(config, "caption_region_start_weight", 0.0))
+    parser.add_argument("--caption-region-warmup-steps", type=int, default=_default_loss_value(config, "caption_region_warmup_steps", 0))
+    parser.add_argument("--caption-region-pos-min-overlap", type=float, default=_default_loss_value(config, "caption_region_pos_min_overlap", 0.3))
+    parser.add_argument("--caption-region-neg-max-overlap", type=float, default=_default_loss_value(config, "caption_region_neg_max_overlap", 0.1))
+    parser.add_argument("--caption-region-overlap-gamma", type=float, default=_default_loss_value(config, "caption_region_overlap_gamma", 1.0))
+    parser.add_argument("--caption-region-detach-overlap", action=argparse.BooleanOptionalAction, default=bool(_default_loss_value(config, "caption_region_detach_overlap", True)))
     parser.add_argument("--branch-bce-weight", type=float, default=_default_loss_value(config, "branch_bce_weight", 0.0))
     parser.add_argument("--branch-logit-scale", type=float, default=_default_loss_value(config, "branch_logit_scale", 5.0))
     parser.add_argument("--residual-negative-weight", type=float, default=_default_loss_value(config, "residual_negative_weight", 0.25))
     parser.add_argument("--detach-text-for-residual", action=argparse.BooleanOptionalAction, default=bool(_default_loss_value(config, "detach_text_for_residual", True)))
     parser.add_argument("--residual-variance-weight", type=float, default=_default_loss_value(config, "residual_variance_weight", 0.0))
     parser.add_argument("--residual-variance-gamma", type=float, default=_default_loss_value(config, "residual_variance_gamma", 1.0))
+    parser.add_argument("--branch-bce-start-weight", type=float, default=_default_loss_value(config, "branch_bce_start_weight", 0.0))
+    parser.add_argument("--residual-variance-start-weight", type=float, default=_default_loss_value(config, "residual_variance_start_weight", 0.0))
+    parser.add_argument("--branch-bce-warmup-steps", type=int, default=_default_loss_value(config, "branch_bce_warmup_steps", 0))
+    parser.add_argument("--residual-variance-warmup-steps", type=int, default=_default_loss_value(config, "residual_variance_warmup_steps", 0))
 
     parser.add_argument("--epochs", type=int, default=_default_from_config(config, "optim", "epochs", 32))
     parser.add_argument("--lr", type=float, default=_default_from_config(config, "optim", "lr", default_optim["lr"]))
@@ -169,7 +184,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eps", type=float, default=_default_from_config(config, "optim", "eps", default_optim["eps"]))
     parser.add_argument("--warmup", type=int, default=_default_from_config(config, "optim", "warmup_steps", 2000))
     parser.add_argument("--accum-freq", type=int, default=_default_from_config(config, "optim", "grad_accum_steps", 1))
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--clamp-logit-scale", action=argparse.BooleanOptionalAction, default=bool(_default_from_config(config, "optim", "clamp_logit_scale", False)))
+    parser.add_argument("--min-logit-scale", type=float, default=_default_from_config(config, "optim", "min_logit_scale", 1.0))
+    parser.add_argument("--max-logit-scale", type=float, default=_default_from_config(config, "optim", "max_logit_scale", 100.0))
+    parser.add_argument("--grad-clip-norm", type=float, default=_default_from_config(config, "optim", "grad_clip_norm", None))
+    parser.add_argument("--max-steps", type=int, default=_default_from_config(config, "training", "max_steps", None))
 
     parser.add_argument("--logs", "--logs-dir", dest="logs_dir", default=_default_from_config(config, "experiment", "output_dir", "outputs"))
     parser.add_argument("--name", default=_default_from_config(config, "experiment", "name"))
@@ -196,6 +215,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 _default_from_config(config, "logging", "debug_finite_checks", False),
             )
         ),
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_default_from_config(config, "training", "torch_compile", False)),
+    )
+    parser.add_argument(
+        "--torch-compile-mode",
+        default=_default_from_config(config, "training", "torch_compile_mode", "reduce-overhead"),
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
+    parser.add_argument(
+        "--torch-compile-backend",
+        default=_default_from_config(config, "training", "torch_compile_backend", "inductor"),
+    )
+    parser.add_argument(
+        "--torch-compile-fullgraph",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_default_from_config(config, "training", "torch_compile_fullgraph", False)),
+    )
+    parser.add_argument(
+        "--torch-compile-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_default_from_config(config, "training", "torch_compile_dynamic", False)),
+    )
+    parser.add_argument(
+        "--torch-compile-disable-errors",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_default_from_config(config, "training", "torch_compile_disable_errors", True)),
     )
     parser.add_argument("--resume", default=None)
     parser.add_argument("--seed", type=int, default=_default_from_config(config, "experiment", "seed", 42))
