@@ -1,0 +1,21 @@
+experiments:
+  - name: spvd_full
+    config: configs/experiments/spvd_full.yaml
+    purpose: full SPVD
+    validates: whether full SPVD with fine-grained text soft cues and two-sided routing constraints is effective
+  - name: spvd_no_route
+    config: configs/experiments/spvd_no_route.yaml
+    purpose: remove routing constraint while keeping routing structure
+    validates: whether routing supervision is necessary when the routing module remains active
+  - name: spvd_pos_only_route
+    config: configs/experiments/spvd_pos_only_route.yaml
+    purpose: only constrain text-relevant visual tokens
+    validates: whether only finding text-relevant visual tokens is insufficient
+  - name: spvd_neg_only_route
+    config: configs/experiments/spvd_neg_only_route.yaml
+    purpose: only constrain text-irrelevant visual tokens
+    validates: whether only finding text-irrelevant visual tokens is insufficient
+  - name: spvd_no_soft_cue
+    config: configs/experiments/spvd_no_soft_cue.yaml
+    purpose: replace fine-grained text soft cue with pooled/EOT text representation
+    validates: whether fine-grained text soft cues are necessary beyond pooled text-conditioned routing

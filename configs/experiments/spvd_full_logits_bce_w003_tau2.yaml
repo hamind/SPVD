@@ -1,0 +1,126 @@
+project_name: SPVD
+use_spvd: true
+
+experiment:
+  name: spvd_full_logits_bce_w003_tau2
+  output_dir: /vepfs/code/SPVD/outputs/experiments/spvd_full_logits_bce_w003_tau2
+  seed: 42
+
+data:
+  dataset: CC3M-recap
+  dataset_path: /vepfs/dataset/cc3m
+  root: /vepfs/dataset/cc3m_longcaption
+  type: webdataset
+  train_data: /vepfs/dataset/cc3m_longcaption/cc3m-train-{0000..0575}.tar
+  train_num_samples: 2823423
+  val_data: null
+  image_key: jpg
+  caption_key: txt
+  filter_relabel_success: true
+  relabel_success_key: longSV
+  strict_caption_match: true
+  num_sampled_captions: 4
+  max_merged_num: 3
+  long_caption_file: null
+  long_caption_index: null
+  metadata_key: null
+  batch_size: 512
+  num_workers: 24
+  prefetch_factor: 2
+  sample_shuffle_size: 5000
+  sample_shuffle_initial: 1000
+  shard_shuffle_size: 2000
+  shard_shuffle_initial: 500
+  persistent_workers: true
+  pin_memory: true
+  tar_mode: r|*
+  tokenize_in_collate: false
+  shuffle: true
+
+model:
+  name: SPVD-ViT-B-16
+  model_config: src/model_configs/SPVD-ViT-B-16.json
+  base_model_type: openclip_style
+  pretrained: ""
+  image_size: 224
+  embed_dim: 512
+  output_dict: true
+  normalize: true
+  use_logit_scale: true
+  init_logit_bias: -10
+  enable_soft_cue_decomp: true
+  use_finegrained_text_cue: true
+  text_cue_type: soft_cue
+  use_text_conditioned_routing: true
+  use_private_branch: true
+  num_soft_cues: 4
+  soft_cue_num_heads: 4
+  soft_cue_num_layers: 1
+  soft_cue_dropout: 0.0
+  relevance_temperature: 2.0
+  routing_temperature: 2.0
+  return_patch_tokens: true
+  use_global_image_head: true
+  normalize_outputs: true
+
+loss:
+  name: spvd
+  align_loss: sigmoid
+  align_weight: 1.0
+  global_align_weight: 1.0
+  caption_align_weight: 1.0
+  dist_impl: bidir
+  use_route_loss: true
+  route_weight: 0.03
+  decomp_loss_weight: 0.03
+  route_positive_constraint: true
+  route_negative_constraint: true
+  use_private_preservation: true
+  residual_loss_weight: 0.05
+  use_disentangle_loss: true
+  orth_loss_weight: 0.003
+  use_uniform_loss: false
+  uniform_weight: 0.0
+  detach_relevance: true
+  residual_variance_gamma: 1.0
+
+regularization:
+  use_uniformity: false
+  uniformity_weight: 0.0
+  use_variance: false
+  variance_weight: 0.0
+  use_covariance: false
+  covariance_weight: 0.0
+  use_effective_rank: false
+  effective_rank_weight: 0.0
+
+optim:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.2
+  betas: [0.9, 0.98]
+  eps: 1.0e-6
+  epochs: 32
+  warmup_steps: 2000
+  grad_accum_steps: 1
+  amp: true
+
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+
+training:
+  debug_finite_checks: true
+
+logging:
+  log_interval: 50
+  save_interval: 1
+  report_to: none
+
+diagnostics:
+  enabled: true
+  log_interval: 50
+  heavy_log_interval: 500
+  per_layer: true
+  log_update_rms: true
+  log_effective_rank: true

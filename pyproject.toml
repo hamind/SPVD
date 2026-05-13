@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spvd-clip"
+version = "0.1.0"
+description = "Minimal CLIP-style image-text pretraining scaffold for SPVD experiments."
+requires-python = ">=3.10"
+dependencies = [
+  "open_clip_torch",
+  "torch",
+  "torchvision",
+  "timm",
+  "Pillow",
+  "PyYAML",
+  "numpy",
+  "pandas",
+  "braceexpand",
+  "webdataset",
+  "tensorboard",
+]
+
+[tool.setuptools]
+py-modules = [
+  "checkpoint",
+  "data",
+  "distributed",
+  "factory",
+  "logger",
+  "losses",
+  "main",
+  "model",
+  "params",
+  "scheduler",
+  "tokenizer",
+  "training",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["eval*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

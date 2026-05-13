@@ -1,0 +1,51 @@
+dataset_root: /vepfs/dataset/benchmark
+model_root: /vepfs/model
+output_dir: outputs/benchmark_eval/spvd_no_route_4gpu
+conda_env: openclip
+device: cuda
+dtype: bf16
+batch_size: 64
+num_workers: 12
+distributed_eval: false
+num_workers_per_gpu: 12
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+pair_chunk_size: 8192
+perf_log_interval: 20
+write_perf_jsonl: true
+random_seed: 42
+dry_run_limit: 8
+compute_random_negative: true
+save_figures: true
+
+eval_mode:
+  spvd_pairwise_mode: exact_cached
+  retrieval_mode: spvd_full
+  rerank_topk: 100
+  score_chunk: 8192
+  pair_chunk_size: 8192
+
+benchmarks:
+  enabled:
+    - aro
+    - sugarcrepe
+    - winoground
+  aro:
+    root: /vepfs/dataset/benchmark/aro
+    order_splits:
+      - test
+      - val
+    order_max_words: 30
+  sugarcrepe:
+    root: /vepfs/dataset/benchmark/sugarcrepe
+  winoground:
+    root: /vepfs/dataset/benchmark/winoground
+
+models:
+  - name: spvd_no_route_4gpu
+    model_type: spvd
+    model_name: SPVD-ViT-B-16
+    checkpoint_path: /vepfs/code/SPVD/outputs/experiments/spvd_no_route_4gpu/spvd_no_route_4gpu/checkpoints/epoch_final.pt
+    source_run_name: spvd_no_route_4gpu
+    image_size: 224

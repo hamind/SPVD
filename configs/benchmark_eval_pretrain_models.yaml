@@ -1,0 +1,104 @@
+dataset_root: /vepfs/dataset/benchmark
+model_root: /vepfs/model
+output_dir: outputs/benchmark_eval
+conda_env: openclip
+device: cuda
+dtype: bf16
+batch_size: 64
+num_workers: 8
+distributed_eval: false
+num_workers_per_gpu: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+pair_chunk_size: 8192
+perf_log_interval: 20
+write_perf_jsonl: true
+random_seed: 42
+dry_run_limit: 8
+compute_random_negative: true
+save_figures: true
+
+eval_mode:
+  spvd_pairwise_mode: exact_cached
+  retrieval_mode: global
+  rerank_topk: 100
+  score_chunk: 8192
+  pair_chunk_size: 8192
+
+benchmarks:
+  enabled:
+    - aro
+    - sugarcrepe
+    - winoground
+  aro:
+    root: /vepfs/dataset/benchmark/aro
+    order_splits:
+      - test
+      - val
+    order_max_words: 30
+  sugarcrepe:
+    root: /vepfs/dataset/benchmark/sugarcrepe
+  winoground:
+    root: /vepfs/dataset/benchmark/winoground
+
+models:
+  - name: clip_vit_b16_openai
+    model_type: hf_clip
+    local_dir: /vepfs/model/openai_clip_vit_b_16
+  - name: clip_vit_b32_openai
+    model_type: hf_clip
+    local_dir: /vepfs/model/openai_clip_vit_b_32
+  - name: clip_vit_l14_openai
+    model_type: hf_clip
+    local_dir: /vepfs/model/openai_clip_vit_l_14
+  - name: metaclip_b32_400m
+    model_type: open_clip
+    model_name: ViT-B-32
+    local_dir: /vepfs/model/metaclip_b32_400m
+    checkpoint_file: metaclip_b32_400m.bin
+  - name: metaclip_l14_400m
+    model_type: open_clip
+    model_name: ViT-L-14
+    local_dir: /vepfs/model/metaclip_l14_400m
+    checkpoint_file: metaclip_l14_400m.bin
+  - name: openclip_vit_b16_datacomp_xl
+    model_type: open_clip
+    model_name: ViT-B-16
+    local_dir: /vepfs/model/openclip_vit_b_16_datacomp_xl_s13b_b90k
+    checkpoint_file: open_clip_pytorch_model.bin
+  - name: openclip_vit_b16_laion2b
+    model_type: open_clip
+    model_name: ViT-B-16
+    local_dir: /vepfs/model/openclip_vit_b_16_laion2b_s34b_b88k
+    checkpoint_file: open_clip_model.safetensors
+  - name: openclip_vit_b32_laion2b
+    model_type: open_clip
+    model_name: ViT-B-32
+    local_dir: /vepfs/model/openclip_vit_b_32_laion2b_s34b_b79k
+    checkpoint_file: open_clip_model.safetensors
+  - name: openclip_vit_l14_datacomp_xl
+    model_type: open_clip
+    model_name: ViT-L-14
+    local_dir: /vepfs/model/openclip_vit_l_14_datacomp_xl_s13b_b90k
+    checkpoint_file: open_clip_pytorch_model.bin
+  - name: openclip_vit_l14_laion2b
+    model_type: open_clip
+    model_name: ViT-L-14
+    local_dir: /vepfs/model/openclip_vit_l_14_laion2b_s32b_b82k
+    checkpoint_file: open_clip_pytorch_model.safetensors
+  - name: siglip_base_p16_224
+    model_type: siglip
+    local_dir: /vepfs/model/siglip_base_patch16_224
+  - name: siglip_base_p16_384
+    model_type: siglip
+    local_dir: /vepfs/model/siglip_base_patch16_384
+  - name: siglip_large_p16_384
+    model_type: siglip
+    local_dir: /vepfs/model/siglip_large_patch16_384
+  - name: siglip_so400m_p14_384
+    model_type: siglip
+    local_dir: /vepfs/model/siglip_so400m_patch14_384
+  - name: siglip2_base_p16_384
+    model_type: siglip
+    local_dir: /vepfs/model/siglip2_base_patch16_384

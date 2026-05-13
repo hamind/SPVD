@@ -1,0 +1,30 @@
+{
+  "embed_dim": 512,
+  "vision_cfg": {
+    "image_size": 224,
+    "layers": 12,
+    "width": 768,
+    "patch_size": 16
+  },
+  "text_cfg": {
+    "context_length": 77,
+    "vocab_size": 49408,
+    "width": 512,
+    "heads": 8,
+    "layers": 12
+  },
+  "tokenizer_model": "ViT-B-16",
+  "spvd_cfg": {
+    "enable_soft_cue_decomp": false,
+    "num_soft_cues": 4,
+    "soft_cue_num_heads": 4,
+    "soft_cue_num_layers": 1,
+    "soft_cue_dropout": 0.0,
+    "return_patch_tokens": true,
+    "use_global_image_head": true,
+    "normalize_outputs": true,
+    "relevance_temperature": 1.0,
+    "routing_temperature": 1.0
+  },
+  "output_dict": true
+}

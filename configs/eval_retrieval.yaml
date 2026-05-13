@@ -1,0 +1,37 @@
+experiment:
+  name: clip_vitb16_cc3m_retrieval
+  output_dir: outputs/retrieval
+  seed: 42
+
+data:
+  root: /vepfs/dataset/cc3m
+  type: webdataset
+  # No validation split was detected. Fill this before running retrieval eval.
+  val_data: null
+  image_key: jpg
+  caption_key: txt
+  metadata_key: json
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+
+model:
+  name: clip_vitb16
+  vision_backbone: vit_base_patch16_224
+  embed_dim: 512
+  image_size: 224
+  text_width: 512
+  text_layers: 12
+  text_heads: 8
+  context_length: 77
+  vocab_size: 49408
+  learnable_logit_scale: true
+  init_logit_scale: 2.659260036932778
+  tokenizer: open_clip
+  tokenizer_model: ViT-B-16
+
+checkpoint:
+  path: null
+
+distributed:
+  backend: nccl

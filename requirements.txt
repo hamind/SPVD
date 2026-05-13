@@ -1,0 +1,12 @@
+torch
+torchvision
+timm
+open_clip_torch
+Pillow
+PyYAML
+numpy
+pandas
+pyarrow
+braceexpand
+webdataset
+tensorboard

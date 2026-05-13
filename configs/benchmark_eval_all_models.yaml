@@ -1,0 +1,92 @@
+dataset_root: /vepfs/dataset/benchmark
+model_root: /vepfs/model
+output_dir: outputs/benchmark_eval
+conda_env: openclip
+device: cuda
+dtype: bf16
+batch_size: 64
+num_workers: 8
+distributed_eval: false
+num_workers_per_gpu: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+pair_chunk_size: 8192
+perf_log_interval: 20
+write_perf_jsonl: true
+random_seed: 42
+dry_run_limit: 8
+compute_random_negative: true
+save_figures: true
+eval_mode:
+  spvd_pairwise_mode: exact_cached
+  retrieval_mode: global
+  rerank_topk: 100
+  score_chunk: 8192
+  pair_chunk_size: 8192
+benchmarks:
+  enabled:
+  - aro
+  - sugarcrepe
+  - winoground
+  aro:
+    root: /vepfs/dataset/benchmark/aro
+    order_splits:
+    - test
+    - val
+    order_max_words: 30
+  sugarcrepe:
+    root: /vepfs/dataset/benchmark/sugarcrepe
+  winoground:
+    root: /vepfs/dataset/benchmark/winoground
+models:
+- name: clip_vit_b32_openai
+  model_type: hf_clip
+  local_dir: /vepfs/model/openai_clip_vit_b_32
+- name: clip_vit_l14_openai
+  model_type: hf_clip
+  local_dir: /vepfs/model/openai_clip_vit_l_14
+- name: openclip_vit_b32_laion2b
+  model_type: open_clip
+  model_name: ViT-B-32
+  pretrained: laion2b_s34b_b79k
+  local_dir: /vepfs/model/openclip_vit_b_32_laion2b_s34b_b79k
+  checkpoint_file: open_clip_model.safetensors
+- name: openclip_vit_h14_laion2b
+  model_type: open_clip
+  model_name: ViT-H-14
+  pretrained: laion2b_s32b_b79k
+  local_dir: /vepfs/model/openclip_vit_h_14_laion2b_s32b_b79k
+  checkpoint_file: open_clip_model.safetensors
+- name: siglip_so400m_p14_384
+  model_type: siglip
+  hf_id: google/siglip-so400m-patch14-384
+- name: blip_itm_base_coco
+  model_type: blip_itm
+  hf_id: Salesforce/blip-itm-base-coco
+- name: openclip_clip_vitb16_cc3m_20260509_185133_epoch_final
+  model_type: open_clip
+  model_name: ViT-B-16
+  checkpoint_path: /vepfs/code/SPVD/outputs/baselines/openclip/openclip_clip_vitb16_cc3m_20260509_185133/checkpoints/epoch_final.pt
+  source_run_name: openclip_clip_vitb16_cc3m_20260509_185133
+- name: openclip_siglip_vitb16_cc3m_20260509_190136_epoch_final
+  model_type: open_clip
+  model_name: ViT-B-16
+  checkpoint_path: /vepfs/code/SPVD/outputs/baselines/openclip/openclip_siglip_vitb16_cc3m_20260509_190136/checkpoints/epoch_final.pt
+  source_run_name: openclip_siglip_vitb16_cc3m_20260509_190136
+- name: spvd_full_epoch_0016
+  model_type: spvd
+  model_name: SPVD-ViT-B-16
+  checkpoint_path: /vepfs/code/SPVD/outputs/experiments/spvd_full/spvd_full/checkpoints/epoch_0016.pt
+  source_run_name: spvd_full
+- name: spvd_soft_cue_vitb16_cc3m_20260509_185648_epoch_final
+  model_type: spvd
+  model_name: SPVD-ViT-B-16
+  checkpoint_path: /vepfs/code/SPVD/outputs/spvd_soft_cue_vitb16_cc3m/spvd_soft_cue_vitb16_cc3m_20260509_185648/checkpoints/epoch_final.pt
+  source_run_name: spvd_soft_cue_vitb16_cc3m_20260509_185648
+model_lists:
+  note: Default all-model config includes pretrained baselines plus distinct final
+    self-trained checkpoints. Add self_trained_epoch_sweep from benchmark_model_lists.json
+    when intentionally running every epoch checkpoint.
+  recommended_full_run_count: 9
+  epoch_sweep_count: 0

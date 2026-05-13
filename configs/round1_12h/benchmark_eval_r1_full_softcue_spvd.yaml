@@ -1,0 +1,52 @@
+dataset_root: /vepfs/dataset/benchmark
+model_root: /vepfs/model
+output_dir: /vepfs/code/SPVD/outputs/benchmark_eval/round1_12h/r1_full_softcue_spvd
+conda_env: openclip
+device: cuda
+dtype: bf16
+batch_size: 64
+num_workers: 12
+distributed_eval: true
+num_workers_per_gpu: 12
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+pair_chunk_size: 8192
+perf_log_interval: 20
+write_perf_jsonl: true
+random_seed: 42
+dry_run_limit: 8
+compute_random_negative: true
+save_figures: true
+
+eval_mode:
+  distributed_eval: true
+  spvd_pairwise_mode: exact_cached
+  retrieval_mode: spvd_full
+  rerank_topk: 100
+  score_chunk: 8192
+  pair_chunk_size: 8192
+
+benchmarks:
+  enabled:
+    - aro
+    - sugarcrepe
+    - winoground
+  aro:
+    root: /vepfs/dataset/benchmark/aro
+    order_splits:
+      - test
+      - val
+    order_max_words: 30
+  sugarcrepe:
+    root: /vepfs/dataset/benchmark/sugarcrepe
+  winoground:
+    root: /vepfs/dataset/benchmark/winoground
+
+models:
+  - name: r1_full_softcue_spvd
+    model_type: spvd
+    model_name: SPVD-ViT-B-16
+    checkpoint_path: /vepfs/code/SPVD/outputs/round1_12h/r1_full_softcue_spvd/r1_full_softcue_spvd/checkpoints/epoch_final.pt
+    source_run_name: r1_full_softcue_spvd
+    image_size: 224
