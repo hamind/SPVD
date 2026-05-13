@@ -11,7 +11,7 @@ from typing import Sequence
 import numpy as np
 import torch
 import yaml
-from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel
 
 from checkpoint import load_checkpoint, save_checkpoint

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -12,37 +10,8 @@ import torch
 from torch import nn
 from torch.cuda.amp import GradScaler
 
-from diagnostics import (
-    collect_feature_tensors,
-    compute_feature_stats,
-    compute_global_param_stats,
-    compute_logits_stats,
-    compute_redundancy_stats,
-    compute_update_stats,
-    snapshot_params_for_update,
-    write_jsonl,
-)
+from diagnostics import write_jsonl
 from distributed import is_master, unwrap_model
-
-
-class AverageMeter:
-    """Running average meter."""
-
-    def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self.val = 0.0
-        self.avg = 0.0
-        self.sum = 0.0
-        self.count = 0
-
-    def update(self, val: float, n: int = 1) -> None:
-        self.val = float(val)
-        self.sum += float(val) * n
-        self.count += n
-        self.avg = self.sum / max(self.count, 1)
-
 
 
 def backward(total_loss: torch.Tensor, scaler: GradScaler | None) -> None:
@@ -125,6 +94,19 @@ def _unpack_outputs(outputs: Any, device: torch.device) -> tuple[torch.Tensor, t
     return image_features, text_features, logit_scale, logit_bias
 
 
+def _extract_logit_scale(outputs: Any, device: torch.device) -> torch.Tensor:
+    """Read logit_scale without assuming OpenCLIP feature-key names."""
+    if isinstance(outputs, dict):
+        logit_scale = outputs.get("logit_scale")
+    else:
+        logit_scale = outputs[2] if isinstance(outputs, (tuple, list)) and len(outputs) >= 3 else None
+    if torch.is_tensor(logit_scale):
+        return logit_scale
+    if logit_scale is not None:
+        return torch.tensor(float(logit_scale), device=device)
+    return torch.tensor(1.0, device=device)
+
+
 def _scalar_loss_dict(loss: torch.Tensor, logit_scale: torch.Tensor) -> dict[str, torch.Tensor]:
     """Return a minimal OpenCLIP-style loss dict for logging."""
     detached = loss.detach()
@@ -144,6 +126,13 @@ def _loss_dict_to_floats(loss_dict: dict[str, torch.Tensor]) -> dict[str, float]
     return values
 
 
+def _is_loss_metric_key(key: str) -> bool:
+    """Keep logs focused on actual loss terms."""
+    if key in {"loss_branch_weight_effective", "loss_residual_variance_weight_effective"}:
+        return False
+    return key == "loss" or key.startswith("loss_") or key.endswith("_loss")
+
+
 def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.Tensor) -> dict[str, float]:
     """Map available scalar loss names to stable train/* diagnostics keys."""
     values = _loss_dict_to_floats(loss_dict)
@@ -155,52 +144,16 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
         "loss_sigmoid": "loss_align",
         "loss_align_global": "loss_align_global",
         "loss_align_caption": "loss_align_caption",
-        "global_align_enabled": "global_align_enabled",
-        "caption_align_enabled": "caption_align_enabled",
         "caption_primary_loss": "caption_primary_loss",
         "caption_pos_loss": "caption_pos_loss",
         "caption_neg_loss": "caption_neg_loss",
-        "caption_margin_sim": "caption_margin_sim",
-        "caption_margin_logit": "caption_margin_logit",
-        "caption_valid_negative_fraction": "caption_valid_negative_fraction",
-        "caption_masked_same_image_pairs": "caption_masked_same_image_pairs",
-        "caption_num_masked_same_image_pairs": "caption_num_masked_same_image_pairs",
-        "caption_num_positive_pairs": "caption_num_positive_pairs",
-        "caption_num_negative_pairs": "caption_num_negative_pairs",
-        "caption_num_pairs": "caption_num_pairs",
-        "caption_num_total_pairs": "caption_num_total_pairs",
-        "caption_num_valid_pairs": "caption_num_valid_pairs",
         "caption_region_positive_loss": "caption_region_positive_loss",
         "caption_region_negative_loss": "caption_region_negative_loss",
         "caption_region_same_image_loss": "caption_region_same_image_loss",
-        "caption_region_positive_active_fraction": "caption_region_positive_active_fraction",
-        "caption_region_negative_active_fraction": "caption_region_negative_active_fraction",
-        "caption_region_positive_weight_sum": "caption_region_positive_weight_sum",
-        "caption_region_negative_weight_sum": "caption_region_negative_weight_sum",
-        "caption_region_overlap_mean": "caption_region_overlap_mean",
-        "caption_region_overlap_min": "caption_region_overlap_min",
-        "caption_region_overlap_max": "caption_region_overlap_max",
-        "caption_region_overlap_std": "caption_region_overlap_std",
-        "caption_region_pos_weight_effective": "caption_region_pos_weight_effective",
-        "caption_region_neg_weight_effective": "caption_region_neg_weight_effective",
-        "caption_region_warmup_alpha": "caption_region_warmup_alpha",
-        "caption_same_image_mode_code": "caption_same_image_mode_code",
         "loss_branch": "loss_branch",
         "loss_branch_s_text": "loss_branch_s_text",
         "loss_branch_r_text": "loss_branch_r_text",
-        "branch_sim_s_text": "branch_sim_s_text",
-        "branch_sim_r_text": "branch_sim_r_text",
-        "branch_gap_s_minus_r": "branch_gap_s_minus_r",
         "loss_residual_variance": "loss_residual_variance",
-        "loss_branch_weight_effective": "loss_branch_weight_effective",
-        "loss_residual_variance_weight_effective": "loss_residual_variance_weight_effective",
-        "logit_scale_exp": "logit_scale_exp",
-        "logit_scale_log": "logit_scale_log",
-        "logit_bias": "logit_bias",
-        "gate_mean": "gate_mean",
-        "gate_std": "gate_std",
-        "gate_min": "gate_min",
-        "gate_max": "gate_max",
         "loss_pri": "loss_private",
         "loss_private": "loss_private",
         "loss_dis": "loss_dis",
@@ -211,7 +164,7 @@ def _prefixed_loss_values(loss_dict: dict[str, torch.Tensor], total_loss: torch.
         "loss_lang_sem": "loss_lang_sem",
     }
     for key, value in values.items():
-        if key == "logit_scale":
+        if key == "logit_scale" or not _is_loss_metric_key(key):
             continue
         metrics[f"train/{aliases.get(key, key)}"] = value
     return metrics
@@ -260,32 +213,16 @@ def train_one_epoch(
     log_interval = int(getattr(args, "log_every_n_steps", 50))
     diagnostics_enabled = bool(getattr(args, "diagnostics_enabled", True))
     diag_log_interval = max(int(getattr(args, "diagnostics_log_interval", log_interval)), 1)
-    heavy_log_interval = max(int(getattr(args, "diagnostics_heavy_log_interval", 500)), 1)
-    diag_eps = float(getattr(args, "diagnostics_eps", 1.0e-12))
-    log_update_rms = bool(getattr(args, "diagnostics_log_update_rms", True))
-    log_effective_rank = bool(getattr(args, "diagnostics_log_effective_rank", True))
-    log_redundancy = bool(getattr(args, "diagnostics_log_redundancy", True))
-    per_layer = bool(getattr(args, "diagnostics_per_layer", True))
-    max_logged_layers = int(getattr(args, "diagnostics_max_logged_layers", 80))
     diag_dir = Path(getattr(args, "log_dir", getattr(args, "logs_dir", ".")))
     train_metrics_path = diag_dir / "train_metrics.jsonl"
-    per_layer_path = diag_dir / "diagnostics_per_layer.jsonl"
     summary_path = diag_dir / "diagnostics_summary.json"
-    world_size = int(getattr(args, "world_size", 1))
-    batch_time_m = AverageMeter()
-    data_time_m = AverageMeter()
-    end = time.perf_counter()
-    start = end
-    samples_seen = 0
     optimizer_steps = 0
-    recent_clip_flags: deque[bool] = deque(maxlen=100)
     last_diagnostics: dict[str, float] = {}
     grad_clip_norm = getattr(args, "grad_clip_norm", None)
     if grad_clip_norm is not None:
         grad_clip_norm = float(grad_clip_norm)
 
     for step, batch in enumerate(data_loader, start=1):
-        data_time_m.update(time.perf_counter() - end)
         images = batch["image"].to(device, non_blocking=True)
         texts = batch["text"].to(device, non_blocking=True)
         current_global_step = global_step_offset + optimizer_steps
@@ -298,210 +235,60 @@ def train_one_epoch(
             raw_loss, loss_dict = _compute_loss(loss_fn, outputs, args, device)
             loss = raw_loss / accum_freq
         backward(loss, scaler)
-        samples_seen += images.shape[0] * world_size
 
         if step % accum_freq == 0:
             next_optimizer_step = global_step_offset + optimizer_steps + 1
             should_log_diag = diagnostics_enabled and next_optimizer_step % diag_log_interval == 0
-            should_log_heavy = diagnostics_enabled and next_optimizer_step % heavy_log_interval == 0
             needs_unscale = (
                 scaler is not None
                 and scaler.is_enabled()
-                and ((grad_clip_norm is not None and grad_clip_norm > 0) or should_log_diag or should_log_heavy)
+                and (grad_clip_norm is not None and grad_clip_norm > 0)
             )
             if needs_unscale:
                 scaler.unscale_(optimizer)
-            grad_stats = compute_global_param_stats(model, distributed=bool(getattr(args, "distributed", False)), eps=diag_eps) if should_log_diag else {}
-            grad_norm_before_clip = grad_stats.get("grad_norm")
-            clip_applied = clip_gradients_(model, grad_clip_norm)
-            if should_log_diag and clip_applied:
-                grad_stats_after_clip = compute_global_param_stats(model, distributed=bool(getattr(args, "distributed", False)), eps=diag_eps)
-                grad_norm_after_clip = grad_stats_after_clip.get("grad_norm")
-            else:
-                grad_norm_after_clip = grad_norm_before_clip
-            recent_clip_flags.append(clip_applied)
-            update_snapshot = None
-            if should_log_diag and log_update_rms:
-                update_snapshot = snapshot_params_for_update(model)
-            old_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else None
+            clip_gradients_(model, grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
-            logit_scale_clamped = False
             if bool(getattr(args, "clamp_logit_scale", False)):
-                logit_scale_clamped = clamp_logit_scale_(
+                clamp_logit_scale_(
                     model,
                     float(getattr(args, "min_logit_scale", 1.0)),
                     float(getattr(args, "max_logit_scale", 100.0)),
                 )
-            new_scale = scaler.get_scale() if scaler is not None and scaler.is_enabled() else old_scale
-            optimizer_step_skipped = bool(old_scale is not None and new_scale is not None and new_scale < old_scale)
-            update_stats: dict[str, float] = {}
-            layer_records: list[dict[str, float | str]] = []
-            if should_log_diag and log_update_rms:
-                if optimizer_step_skipped:
-                    update_stats = {"update_rms": 0.0, "update_weight_ratio": 0.0}
-                else:
-                    update_stats, layer_records = compute_update_stats(
-                        model,
-                        update_snapshot,
-                        distributed=bool(getattr(args, "distributed", False)),
-                        eps=diag_eps,
-                        max_logged_layers=max_logged_layers if per_layer and should_log_heavy else 0,
-                    )
             optimizer.zero_grad(set_to_none=True)
             optimizer_steps += 1
             if should_log_diag and is_master(args):
-                elapsed = max(time.perf_counter() - start, 1e-6)
-                lr = optimizer.param_groups[0]["lr"]
                 raw_loss_value = float((loss.detach() * accum_freq).cpu())
-                metrics: dict[str, float] = {
-                    "train/lr": float(lr),
-                    "train/data_time": float(data_time_m.val),
-                    "train/batch_time": float(batch_time_m.val),
-                    "train/samples_per_second": samples_seen / elapsed,
-                    "train/grad_norm_before_clip": float(grad_norm_before_clip or 0.0),
-                    "train/grad_norm_after_clip": float(grad_norm_after_clip or 0.0),
-                    "train/clip_applied": float(clip_applied),
-                    "train/clip_fraction": sum(recent_clip_flags) / max(len(recent_clip_flags), 1),
-                    "train/logit_scale_clamped": float(logit_scale_clamped),
-                    "train/optimizer_step_skipped": float(optimizer_step_skipped),
-                }
-                metrics.update(_prefixed_loss_values(loss_dict, loss.detach() * accum_freq))
-                metrics.update({f"train/{key}": value for key, value in grad_stats.items()})
-                metrics.update({f"train/{key}": value for key, value in update_stats.items()})
-                metrics.update(compute_logits_stats(outputs, eps=diag_eps))
-                metrics.update(_model_logit_stats(model, eps=diag_eps))
-                metrics["train/logit_scale_clamped"] = float(logit_scale_clamped)
-                if should_log_heavy:
-                    features = collect_feature_tensors(outputs)
-                    if log_effective_rank:
-                        for name, tensor in features.items():
-                            metrics.update(compute_feature_stats(tensor, f"train/{name}", eps=diag_eps))
-                    if log_redundancy:
-                        metrics.update(compute_redundancy_stats(features.get("z_vs"), features.get("z_vp"), eps=diag_eps))
+                metrics = _prefixed_loss_values(loss_dict, loss.detach() * accum_freq)
                 record = {
                     "step": step,
                     "epoch": epoch,
                     "global_step": next_optimizer_step,
-                    "lr": lr,
                     "loss_total": metrics.get("train/loss_total", raw_loss_value),
-                    "grad_rms": metrics.get("train/grad_rms"),
-                    "weight_rms": metrics.get("train/weight_rms"),
-                    "update_rms": metrics.get("train/update_rms"),
                     **metrics,
                 }
                 write_jsonl(train_metrics_path, record)
-                if per_layer and should_log_heavy:
-                    for layer_record in layer_records:
-                        write_jsonl(per_layer_path, {"step": step, "epoch": epoch, "global_step": next_optimizer_step, **layer_record})
-                        layer_name = str(layer_record["layer_name"])
-                        for key in ("weight_rms", "grad_rms", "update_rms", "update_weight_ratio"):
-                            metrics[f"train/layer/{layer_name}/{key}"] = float(layer_record[key])
                 _write_tb_scalars(tb_writer, metrics, next_optimizer_step)
                 last_diagnostics = metrics
 
         if is_master(args) and step % log_interval == 0:
-            elapsed = max(time.perf_counter() - start, 1e-6)
-            lr = optimizer.param_groups[0]["lr"]
-            _, _, logit_scale, _ = _unpack_outputs(outputs, device)
             raw_loss_value = float((loss.detach() * accum_freq).cpu())
-            logit_scale_value = float(logit_scale.detach().cpu())
-            samples_per_second = samples_seen / elapsed
-            batch_time_m.update(time.perf_counter() - end)
             loss_values = _loss_dict_to_floats(loss_dict)
-            loss_values.update({key.removeprefix("train/"): value for key, value in _model_logit_stats(model, eps=diag_eps).items()})
-            loss_values["logit_scale_clamped"] = float(logit_scale_clamped)
-            loss_values["clip_applied"] = float(clip_applied)
-            loss_values["clip_fraction"] = sum(recent_clip_flags) / max(len(recent_clip_flags), 1)
-            aux_keys = (
-                "loss_align",
-                "loss_sigmoid",
-                "loss_align_global",
-                "loss_align_caption",
-                "global_align_enabled",
-                "caption_align_enabled",
-                "caption_primary_loss",
-                "caption_pos_loss",
-                "caption_neg_loss",
-                "caption_margin_sim",
-                "caption_margin_logit",
-                "caption_valid_negative_fraction",
-                "caption_masked_same_image_pairs",
-                "caption_num_masked_same_image_pairs",
-                "caption_num_positive_pairs",
-                "caption_num_negative_pairs",
-                "caption_num_pairs",
-                "caption_num_total_pairs",
-                "caption_num_valid_pairs",
-                "caption_region_positive_loss",
-                "caption_region_negative_loss",
-                "caption_region_same_image_loss",
-                "caption_region_positive_active_fraction",
-                "caption_region_negative_active_fraction",
-                "caption_region_positive_weight_sum",
-                "caption_region_negative_weight_sum",
-                "caption_region_overlap_mean",
-                "caption_region_overlap_min",
-                "caption_region_overlap_max",
-                "caption_region_overlap_std",
-                "caption_region_pos_weight_effective",
-                "caption_region_neg_weight_effective",
-                "caption_region_warmup_alpha",
-                "caption_same_image_mode_code",
-                "logit_scale_exp",
-                "logit_scale_log",
-                "logit_bias",
-                "logit_scale_clamped",
-                "loss_branch",
-                "loss_branch_s_text",
-                "loss_branch_r_text",
-                "branch_sim_s_text",
-                "branch_sim_r_text",
-                "branch_gap_s_minus_r",
-                "loss_residual_variance",
-                "loss_branch_weight_effective",
-                "loss_residual_variance_weight_effective",
-                "clip_applied",
-                "clip_fraction",
-                "gate_mean",
-                "gate_std",
-                "gate_min",
-                "gate_max",
-                "loss_pri",
-                "loss_dis",
-                "loss_sem",
-                "shared_coverage",
-                "private_coverage",
-            )
-            aux_text = " ".join(f"{key}={loss_values[key]:.4f}" for key in aux_keys if key in loss_values)
-            logger.info(
-                "epoch=%s step=%s loss=%.4f logit_scale=%.3f lr=%.6g data_time=%.3f batch_time=%.3f samples/sec=%.2f%s",
-                epoch,
-                step,
-                raw_loss_value,
-                logit_scale_value,
-                lr,
-                data_time_m.avg,
-                batch_time_m.avg,
-                samples_per_second,
-                f" {aux_text}" if aux_text else "",
-            )
+            logged_losses: dict[str, float] = {"loss": raw_loss_value}
+            for key, value in loss_values.items():
+                if key != "loss" and _is_loss_metric_key(key):
+                    logged_losses[key] = value
+            loss_text = " ".join(f"{key}={value:.4f}" for key, value in logged_losses.items())
+            logger.info("epoch=%s step=%s %s", epoch, step, loss_text)
             if tb_writer is not None and not (diagnostics_enabled and (global_step_offset + optimizer_steps) % diag_log_interval == 0):
                 tb_step = global_step_offset + optimizer_steps
-                tb_writer.add_scalar("train/loss", raw_loss_value, tb_step)
-                tb_writer.add_scalar("train/logit_scale", logit_scale_value, tb_step)
-                tb_writer.add_scalar("train/lr", lr, tb_step)
-                tb_writer.add_scalar("train/data_time", data_time_m.val, tb_step)
-                tb_writer.add_scalar("train/batch_time", batch_time_m.val, tb_step)
-                tb_writer.add_scalar("train/samples_per_second", samples_per_second, tb_step)
-                for key, value in loss_values.items():
-                    if key not in {"loss", "logit_scale"}:
-                        tb_writer.add_scalar(f"train/{key}", value, tb_step)
+                for key, value in logged_losses.items():
+                    tb_key = "train/loss_total" if key == "loss" else f"train/{key}"
+                    tb_writer.add_scalar(tb_key, value, tb_step)
 
         max_steps = getattr(args, "max_steps", None)
         if max_steps is not None and (global_step_offset + optimizer_steps) >= int(max_steps):
             break
-        end = time.perf_counter()
     if diagnostics_enabled and is_master(args) and last_diagnostics:
         import json
 

@@ -36,15 +36,59 @@ class ParseKwargs(argparse.Action):
         setattr(namespace, self.dest, kwargs)
 
 
-def _read_yaml(path: str | None) -> dict[str, Any]:
-    """Read a YAML config if provided."""
+def _deep_merge_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge config mappings, with child values winning."""
+    merged = dict(base)
+    for key, value in override.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _resolve_inherited_paths(config_path: Path, inherited: Any) -> list[Path]:
+    """Resolve one or more inherited YAML paths relative to the child config."""
+    if isinstance(inherited, (str, Path)):
+        raw_paths = [inherited]
+    elif isinstance(inherited, list) and all(isinstance(item, (str, Path)) for item in inherited):
+        raw_paths = inherited
+    else:
+        raise ValueError(f"Config inheritance must be a path or list of paths: {config_path}")
+
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        inherited_path = Path(raw_path).expanduser()
+        if not inherited_path.is_absolute():
+            inherited_path = config_path.parent / inherited_path
+        paths.append(inherited_path.resolve())
+    return paths
+
+
+def _read_yaml(path: str | None, seen: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Read a YAML config, resolving optional base/extends inheritance."""
     if not path:
         return {}
-    with Path(path).open("r", encoding="utf-8") as handle:
+
+    config_path = Path(path).expanduser().resolve()
+    if config_path in seen:
+        chain = " -> ".join(str(item) for item in (*seen, config_path))
+        raise ValueError(f"Config inheritance cycle detected: {chain}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Config must be a mapping: {path}")
-    return payload
+
+    inherited = payload.pop("extends", payload.pop("base", None))
+    if not inherited:
+        return payload
+
+    merged: dict[str, Any] = {}
+    for inherited_path in _resolve_inherited_paths(config_path, inherited):
+        merged = _deep_merge_config(merged, _read_yaml(str(inherited_path), (*seen, config_path)))
+    return _deep_merge_config(merged, payload)
 
 
 def _default_from_config(config: dict[str, Any], section: str, key: str, default: Any = None) -> Any:
@@ -152,19 +196,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-loss", action="store_true", default=bool(_default_loss_value(config, "local_loss", True)))
     parser.add_argument("--gather-with-grad", action="store_true", default=bool(_default_loss_value(config, "gather_with_grad", True)))
     parser.add_argument("--align-weight", type=float, default=_default_loss_value(config, "align_weight", 1.0))
-    parser.add_argument("--global-align-weight", type=float, default=_default_loss_value(config, "global_align_weight", 1.0))
+    parser.add_argument("--global-align-weight", type=float, default=_default_loss_value(config, "global_align_weight", 0.0))
     parser.add_argument("--caption-align-weight", type=float, default=_default_loss_value(config, "caption_align_weight", 1.0))
     parser.add_argument("--caption-loss-impl", default=_default_loss_value(config, "caption_loss_impl", "masked_sigmoid"), choices=["masked_sigmoid", "openclip_siglip"])
-    parser.add_argument("--caption-mask-same-image", action=argparse.BooleanOptionalAction, default=bool(_default_loss_value(config, "caption_mask_same_image", True)))
-    parser.add_argument("--caption-same-image-mode", default=_default_loss_value(config, "caption_same_image_mode", "ignore"), choices=["ignore", "region_soft_positive", "region_soft_signed"])
-    parser.add_argument("--caption-region-pos-weight", type=float, default=_default_loss_value(config, "caption_region_pos_weight", 0.05))
-    parser.add_argument("--caption-region-neg-weight", type=float, default=_default_loss_value(config, "caption_region_neg_weight", 0.02))
-    parser.add_argument("--caption-region-start-weight", type=float, default=_default_loss_value(config, "caption_region_start_weight", 0.0))
-    parser.add_argument("--caption-region-warmup-steps", type=int, default=_default_loss_value(config, "caption_region_warmup_steps", 0))
-    parser.add_argument("--caption-region-pos-min-overlap", type=float, default=_default_loss_value(config, "caption_region_pos_min_overlap", 0.3))
-    parser.add_argument("--caption-region-neg-max-overlap", type=float, default=_default_loss_value(config, "caption_region_neg_max_overlap", 0.1))
-    parser.add_argument("--caption-region-overlap-gamma", type=float, default=_default_loss_value(config, "caption_region_overlap_gamma", 1.0))
-    parser.add_argument("--caption-region-detach-overlap", action=argparse.BooleanOptionalAction, default=bool(_default_loss_value(config, "caption_region_detach_overlap", True)))
+    parser.add_argument("--caption-same-image-mode", default=_default_loss_value(config, "caption_same_image_mode", "ignore"), choices=["ignore", "positive", "signed"])
     parser.add_argument("--branch-bce-weight", type=float, default=_default_loss_value(config, "branch_bce_weight", 0.0))
     parser.add_argument("--branch-logit-scale", type=float, default=_default_loss_value(config, "branch_logit_scale", 5.0))
     parser.add_argument("--residual-negative-weight", type=float, default=_default_loss_value(config, "residual_negative_weight", 0.25))

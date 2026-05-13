@@ -1,0 +1,69 @@
+project_name: SPVD
+use_spvd: true
+
+experiment:
+  seed: 42
+
+data:
+  dataset: CC3M-recap
+  dataset_path: /vepfs/dataset/cc3m
+  root: /vepfs/dataset/cc3m_longcaption
+  type: webdataset
+  train_data: /vepfs/dataset/cc3m_longcaption/cc3m-train-{0000..0575}.tar
+  train_num_samples: 2823423
+  val_data: null
+  image_key: jpg
+  caption_key: txt
+  filter_relabel_success: true
+  relabel_success_key: longSV
+  strict_caption_match: true
+  num_sampled_captions: 4
+  max_merged_num: 3
+  caption_relabel_file: null
+  caption_relabel_index: null
+  metadata_key: null
+  batch_size: 512
+  num_workers: 12
+  prefetch_factor: 2
+  sample_shuffle_size: 5000
+  sample_shuffle_initial: 1000
+  shard_shuffle_size: 2000
+  shard_shuffle_initial: 500
+  persistent_workers: true
+  pin_memory: true
+  tar_mode: r|*
+
+optim:
+  optimizer: adamw
+  lr: 5.0e-4
+  weight_decay: 0.2
+  betas: [0.9, 0.98]
+  eps: 1.0e-6
+  epochs: 32
+  warmup_steps: 2000
+  grad_accum_steps: 1
+  amp: true
+
+distributed:
+  backend: nccl
+  find_unused_parameters: false
+
+logging:
+  log_interval: 50
+  save_interval: 1
+  report_to: none
+
+diagnostics:
+  enabled: true
+  log_interval: 50
+  heavy_log_interval: 500
+  per_layer: true
+  log_update_rms: true
+  log_effective_rank: true
+  log_redundancy: true
+  max_logged_layers: 80
+  eps: 1.0e-12
+
+training:
+  debug_finite_checks: false
+  torch_compile: true

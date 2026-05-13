@@ -396,12 +396,16 @@ class SoftCueSigmoidDecomposition(nn.Module):
         self.out_residual_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
     def forward(self, visual_tokens: Tensor, soft_cues: Tensor) -> dict[str, Tensor]:
-        """Decompose visual tokens [B, M, D_v] using cues [B, S, D] or [B, K, S, D]."""
-        if soft_cues.ndim not in {3, 4}:
-            raise ValueError("soft_cues must have shape [B, S, D] or [B, K, S, D].")
-        single_caption = soft_cues.ndim == 3
-        if single_caption:
-            soft_cues = soft_cues.unsqueeze(1)
+        """Decompose visual tokens [B, N, D_v] using multi-caption cues [B, K, S, D]."""
+        if visual_tokens.ndim != 3:
+            raise ValueError(f"visual_tokens must have shape [B, N, D_v], got {tuple(visual_tokens.shape)}.")
+        if soft_cues.ndim != 4:
+            raise ValueError(f"soft_cues must have shape [B, K, S, D], got {tuple(soft_cues.shape)}.")
+        if soft_cues.shape[0] != visual_tokens.shape[0]:
+            raise ValueError(
+                "visual_tokens and soft_cues must have the same batch size, "
+                f"got {visual_tokens.shape[0]} and {soft_cues.shape[0]}."
+            )
 
         visual_tokens = visual_tokens.to(dtype=self.key_proj.weight.dtype)
         soft_cues = soft_cues.to(device=visual_tokens.device, dtype=self.query_proj.weight.dtype)
@@ -429,15 +433,6 @@ class SoftCueSigmoidDecomposition(nn.Module):
 
         semantic_features = self.out_semantic_proj(self.out_semantic_norm(semantic_features))
         residual_features = self.out_residual_proj(self.out_residual_norm(residual_features))
-
-        if single_caption:
-            cue_semantic = cue_semantic.squeeze(1)
-            cue_residual = cue_residual.squeeze(1)
-            semantic_features = semantic_features.squeeze(1)
-            residual_features = residual_features.squeeze(1)
-            sigmoid_map = sigmoid_map.squeeze(1)
-            residual_map = residual_map.squeeze(1)
-            gate_logits = gate_logits.squeeze(1)
 
         return {
             "semantic_features": semantic_features,
@@ -601,55 +596,65 @@ class SPVDModel(nn.Module):
             "image_tokens": image_tokens,
         }
 
-    def encode_text(
+    def encode_text_tokens(
         self,
-        text: Tensor,
+        text_2d: Tensor,
         normalize: bool = False,
         return_tokens: bool = False,
     ) -> Tensor | dict[str, Tensor]:
-        """OpenCLIP-style text encoding with optional multi-caption input.
+        """Encode flattened text tokens shaped [N, L]."""
+        if text_2d.ndim != 2:
+            raise ValueError(f"encode_text_tokens expects text with shape [N, L], got {tuple(text_2d.shape)}.")
 
-        Text may be shaped [B, L] or [B, K, L]. Multi-caption
-        inputs are flattened to [B*K, L] for the text tower, then pooled
-        back to one text feature per image while exposing all caption tokens to
-        the SPVD cue extractor.
-        """
-        if text.ndim not in {2, 3}:
-            raise ValueError(f"Text must have shape [B, L] or [B, K, L], got {tuple(text.shape)}.")
-
-        multi_caption = text.ndim == 3
-        if multi_caption:
-            batch_size, captions_per_sample, context_length = text.shape
-            text_for_encoder = text.reshape(batch_size * captions_per_sample, context_length)
-        else:
-            batch_size, context_length = text.shape
-            captions_per_sample = 1
-            text_for_encoder = text
-
+        _, context_length = text_2d.shape
         if context_length > int(self.positional_embedding.shape[0]):
             raise ValueError(f"Text length {context_length} exceeds context length {int(self.positional_embedding.shape[0])}.")
-        text_attention_mask = text_for_encoder.ne(self.text_pad_id)
+        text_attention_mask = text_2d.ne(self.text_pad_id)
 
         cast_dtype = self._text_cast_dtype()
-        x = self.token_embedding(text_for_encoder).to(cast_dtype)
+        x = self.token_embedding(text_2d).to(cast_dtype)
         x = x + self.positional_embedding[:context_length].to(device=x.device, dtype=cast_dtype)
         text_tokens = self.transformer(x, attn_mask=self._text_attn_mask(context_length, x.device))
         text_tokens = self.ln_final(text_tokens)
 
         text_global = text_global_pool(
             text_tokens,
-            text_for_encoder,
+            text_2d,
             self.text_pool_type,
             eos_token_id=getattr(self, "text_eos_id", None),
         )
         text_global = apply_projection(text_global, self.text_projection)
-
-        if multi_caption:
-            text_tokens = text_tokens.reshape(batch_size, captions_per_sample, context_length, text_tokens.shape[-1])
-            text_global = text_global.reshape(batch_size, captions_per_sample, -1)
-            text_attention_mask = text_attention_mask.reshape(batch_size, captions_per_sample, context_length)
         if normalize:
             text_global = F.normalize(text_global, dim=-1)
+        if not return_tokens:
+            return text_global
+        return {
+            "text_global": text_global,
+            "text_tokens": text_tokens,
+            "text_attention_mask": text_attention_mask,
+        }
+
+    def encode_text_multi(
+        self,
+        text_3d: Tensor,
+        normalize: bool = False,
+        return_tokens: bool = False,
+    ) -> Tensor | dict[str, Tensor]:
+        """Encode training text shaped [B, K, L], preserving the caption axis."""
+        if text_3d.ndim != 3:
+            raise ValueError(f"encode_text_multi expects text with shape [B, K, L], got {tuple(text_3d.shape)}.")
+        batch_size, captions_per_sample, context_length = text_3d.shape
+        flat_text = text_3d.reshape(batch_size * captions_per_sample, context_length)
+        flat_outputs = self.encode_text_tokens(flat_text, normalize=normalize, return_tokens=True)
+        if not isinstance(flat_outputs, dict):
+            raise RuntimeError("encode_text_tokens(return_tokens=True) must return a dictionary.")
+
+        flat_global = flat_outputs["text_global"]
+        flat_tokens = flat_outputs["text_tokens"]
+        flat_attention_mask = flat_outputs["text_attention_mask"]
+        text_global = flat_global.reshape(batch_size, captions_per_sample, -1)
+        text_tokens = flat_tokens.reshape(batch_size, captions_per_sample, context_length, flat_tokens.shape[-1])
+        text_attention_mask = flat_attention_mask.reshape(batch_size, captions_per_sample, context_length)
 
         if not return_tokens:
             return text_global
@@ -661,31 +666,57 @@ class SPVDModel(nn.Module):
         }
         if self.enable_soft_cue_decomp:
             if self.uses_soft_cue_extractor:
-                if text_tokens.ndim == 4:
-                    batch_size, captions_per_sample, context_length, token_dim = text_tokens.shape
-                    flat_text_tokens = text_tokens.reshape(batch_size * captions_per_sample, context_length, token_dim)
-                    flat_attention_mask = text_attention_mask.reshape(batch_size * captions_per_sample, context_length)
-                    flat_cue = self.soft_cue_extractor(flat_text_tokens, attention_mask=flat_attention_mask)
-                    cue = flat_cue.reshape(batch_size, captions_per_sample, flat_cue.shape[1], flat_cue.shape[2])
-                else:
-                    cue = self.soft_cue_extractor(text_tokens, attention_mask=text_attention_mask)
+                flat_cue = self.soft_cue_extractor(flat_tokens, attention_mask=flat_attention_mask)
+                cue = flat_cue.reshape(batch_size, captions_per_sample, flat_cue.shape[1], flat_cue.shape[2])
             else:
-                if text_global.ndim == 3:
-                    cue = text_global.unsqueeze(2).to(dtype=text_tokens.dtype)
-                else:
-                    cue = text_global.unsqueeze(1).to(dtype=text_tokens.dtype)
+                cue = text_global.unsqueeze(2).to(dtype=text_tokens.dtype)
             outputs["cue"] = cue
             outputs["soft_cues"] = cue
         return outputs
 
+    def encode_text(
+        self,
+        text: Tensor,
+        normalize: bool = False,
+        return_tokens: bool = False,
+    ) -> Tensor | dict[str, Tensor]:
+        """Compatibility text encoder.
+
+        SPVD training calls encode_text_multi() directly. This method does not
+        synthesize single-caption soft cues; pairwise scoring wraps [B, L] text
+        as [B, 1, L] before entering the decomposition path.
+        """
+        if text.ndim == 3:
+            return self.encode_text_multi(text, normalize=normalize, return_tokens=return_tokens)
+        if text.ndim != 2:
+            raise ValueError(f"Text must have shape [B, L] or [B, K, L], got {tuple(text.shape)}.")
+        return self.encode_text_tokens(text, normalize=normalize, return_tokens=return_tokens)
+
     def get_logits_as_clip(self, image: Tensor, text: Tensor) -> tuple[Tensor, Tensor]:
-        """Return global CLIP-style logits."""
+        """Return global CLIP-style logits for non-SPVD compatibility.
+
+        This is not the SPVD caption-conditioned training path.
+        """
+        if self.enable_soft_cue_decomp:
+            raise ValueError(
+                "get_logits_as_clip is disabled for SPVD decomposition models. "
+                "Use forward_spvd() with text shape [B, K, L] for training or "
+                "score_pairwise() for paired single-caption evaluation."
+            )
+        if text.ndim != 2:
+            raise ValueError(
+                "get_logits_as_clip expects single-caption token ids with shape [B, L]. "
+                "SPVD training uses forward_spvd() with text shape [B, K, L]."
+            )
         image_features = self.encode_image(image, normalize=True)
         text_features = self.encode_text(text, normalize=True)
         if not torch.is_tensor(image_features) or not torch.is_tensor(text_features):
             raise RuntimeError("Global CLIP logits require tensor image and text features.")
-        if text_features.ndim == 3:
-            text_features = F.normalize(text_features.mean(dim=1), dim=-1)
+        if text_features.ndim != 2:
+            raise RuntimeError(
+                "Global CLIP logits require text features with shape [B, D]. "
+                "Do not average [B, K, D] SPVD caption features into a global feature."
+            )
         image_logits = self.logit_scale.exp() * image_features @ text_features.t()
         if self.logit_bias is not None:
             image_logits = image_logits + self.logit_bias
@@ -703,12 +734,20 @@ class SPVDModel(nn.Module):
     def forward_spvd(self, image: Tensor, text: Tensor) -> dict[str, Any]:
         """Return CLIP-style features, with optional soft-cue decomposition."""
         if not self.enable_soft_cue_decomp:
+            if text.ndim != 2:
+                raise ValueError(
+                    "Non-decomposition baseline forward expects text token ids with shape [B, L]. "
+                    "SPVD decomposition training expects text shape [B, K, L]."
+                )
             image_features = self.encode_image(image, normalize=self.normalize_outputs)
             text_features = self.encode_text(text, normalize=self.normalize_outputs)
             if not torch.is_tensor(image_features) or not torch.is_tensor(text_features):
                 raise RuntimeError("Baseline SPVD forward requires tensor image and text features.")
-            if text_features.ndim == 3:
-                text_features = F.normalize(text_features.mean(dim=1), dim=-1) if self.normalize_outputs else text_features.mean(dim=1)
+            if text_features.ndim != 2:
+                raise RuntimeError(
+                    "Baseline forward requires text features with shape [B, D]. "
+                    "Do not average [B, K, D] SPVD caption features into a global feature."
+                )
             outputs: dict[str, Any] = {
                 "image_features": image_features,
                 "text_features": text_features,
@@ -718,8 +757,13 @@ class SPVDModel(nn.Module):
                 outputs["logit_bias"] = self.logit_bias
             return outputs
 
+        if text.ndim != 3:
+            raise ValueError(
+                "SPVD training forward expects multi-sub-caption text with shape [B,K,L]. "
+                "Use score_pairwise() for single-caption scoring."
+            )
         image_outputs = self.encode_image(image, normalize=False, return_tokens=True)
-        text_outputs = self.encode_text(text, normalize=self.normalize_outputs, return_tokens=True)
+        text_outputs = self.encode_text_multi(text, normalize=self.normalize_outputs, return_tokens=True)
         image_tokens = image_outputs["image_tokens"]
         image_global = image_outputs["image_global"]
         text_tokens = text_outputs["text_tokens"]
@@ -732,22 +776,21 @@ class SPVDModel(nn.Module):
         if image_tokens is None:
             raise RuntimeError("Visual encoder did not return patch tokens.")
 
-        caption_text_features = text_global if text_global.ndim == 3 else None
-        if text_global.ndim == 3:
-            text_features = F.normalize(text_global.mean(dim=1), dim=-1) if self.normalize_outputs else text_global.mean(dim=1)
-        else:
-            text_features = text_global
-
         decomp_outputs = self.soft_cue_decomposition(image_tokens, soft_cues)
-        shared_global = decomp_outputs["semantic_features"]
-        residual_global = decomp_outputs["residual_features"]
+        semantic_features = self._maybe_normalize(decomp_outputs["semantic_features"])
+        residual_features = self._maybe_normalize(decomp_outputs["residual_features"])
+        caption_text_features = text_global
+        global_image_features = self._maybe_normalize(image_global)
         outputs = {
-            "image_features": shared_global,
-            "text_features": text_features,
+            "global_image_features": global_image_features,
             "logit_scale": self.logit_scale.exp(),
-            "shared_visual_features": shared_global,
-            "residual_visual_features": residual_global,
+            "caption_semantic_visual_features": semantic_features,
+            "caption_shared_visual_features": semantic_features,
+            "shared_visual_features": semantic_features,
+            "caption_residual_visual_features": residual_features,
+            "residual_visual_features": residual_features,
             "caption_text_features": caption_text_features,
+            "text_features": caption_text_features,
             "sigmoid_map": decomp_outputs["sigmoid_map"],
             "residual_map": decomp_outputs["residual_map"],
             "gate_logits": decomp_outputs["gate_logits"],
@@ -755,6 +798,48 @@ class SPVDModel(nn.Module):
         if self.logit_bias is not None:
             outputs["logit_bias"] = self.logit_bias
         return outputs
+
+    def score_pairwise(
+        self,
+        image: Tensor,
+        text: Tensor,
+        return_dict: bool = False,
+    ) -> Tensor | dict[str, Tensor]:
+        """Score paired image/text inputs shaped image [B,C,H,W] and text [B,L]."""
+        if text.ndim != 2:
+            raise ValueError(f"score_pairwise expects text with shape [B, L], got {tuple(text.shape)}.")
+        if not self.enable_soft_cue_decomp:
+            image_features = self.encode_image(image, normalize=True)
+            text_features = self.encode_text_tokens(text, normalize=True)
+            if not torch.is_tensor(image_features) or not torch.is_tensor(text_features):
+                raise RuntimeError("Pairwise scoring requires tensor image and text features.")
+            score = (image_features * text_features).sum(dim=-1) * self.logit_scale.exp()
+            if self.logit_bias is not None:
+                score = score + self.logit_bias
+            if return_dict:
+                return {
+                    "score": score,
+                    "image_features": image_features,
+                    "text_features": text_features,
+                }
+            return score
+
+        outputs = self.forward_spvd(image, text.unsqueeze(1))
+        semantic = outputs["caption_semantic_visual_features"][:, 0]
+        text_features = outputs["caption_text_features"][:, 0]
+        semantic = F.normalize(semantic.float(), dim=-1)
+        text_features = F.normalize(text_features.float(), dim=-1)
+        score = (semantic * text_features).sum(dim=-1) * outputs["logit_scale"]
+        if self.logit_bias is not None:
+            score = score + self.logit_bias
+        if return_dict:
+            return {
+                "score": score,
+                "semantic_features": semantic,
+                "text_features": text_features,
+                "sigmoid_map": outputs["sigmoid_map"][:, 0],
+            }
+        return score
 
     def forward(
         self,
@@ -781,6 +866,9 @@ class SPVDModel(nn.Module):
         outputs = self.forward_spvd(image, text)
         if use_dict:
             return outputs
+        image_like = outputs.get("image_features")
+        if image_like is None:
+            image_like = outputs.get("caption_semantic_visual_features")
         if self.logit_bias is not None:
-            return outputs["image_features"], outputs["text_features"], outputs["logit_scale"], self.logit_bias
-        return outputs["image_features"], outputs["text_features"], outputs["logit_scale"]
+            return image_like, outputs["text_features"], outputs["logit_scale"], self.logit_bias
+        return image_like, outputs["text_features"], outputs["logit_scale"]

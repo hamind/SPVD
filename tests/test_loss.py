@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 from open_clip.loss import ClipLoss
@@ -71,6 +72,7 @@ def test_spvd_loss_without_decomposition_uses_alignment_only() -> None:
         gather_with_grad=True,
         rank=0,
         world_size=1,
+        global_align_weight=1.0,
         residual_variance_gamma=1.0,
     )
     loss_fn = create_loss(args)
@@ -93,57 +95,56 @@ def test_spvd_loss_without_decomposition_uses_alignment_only() -> None:
     assert outputs["text_features"].grad is not None
 
 
-def test_spvd_loss_prefers_flattened_caption_sigmoid_alignment() -> None:
-    image_features = torch.randn(2, 8, requires_grad=True)
-    text_features = torch.randn(2, 8, requires_grad=True)
+def test_spvd_loss_uses_explicit_caption_sigmoid_alignment() -> None:
     caption_visual_features = torch.randn(2, 3, 8, requires_grad=True)
     caption_text_features = torch.randn(2, 3, 8, requires_grad=True)
     logit_scale = torch.tensor(10.0)
     outputs = {
-        "image_features": image_features,
-        "text_features": text_features,
-        "caption_shared_visual_features": caption_visual_features,
+        "caption_semantic_visual_features": caption_visual_features,
         "caption_text_features": caption_text_features,
         "logit_scale": logit_scale,
     }
-    loss_fn = SPVDLoss(rank=0, world_size=1, caption_loss_impl="openclip_siglip")
+    loss_fn = SPVDLoss(rank=0, world_size=1, global_align_weight=0.0, caption_loss_impl="openclip_siglip")
 
     loss, loss_dict = loss_fn(outputs)
-    expected_global = OpenCLIPSigLipLoss(rank=0, world_size=1)(
-        F.normalize(image_features.float(), dim=-1),
-        F.normalize(text_features.float(), dim=-1),
-        logit_scale,
-        None,
-    )
     expected_caption = OpenCLIPSigLipLoss(rank=0, world_size=1)(
         F.normalize(caption_visual_features.reshape(-1, 8).float(), dim=-1),
         F.normalize(caption_text_features.reshape(-1, 8).float(), dim=-1),
         logit_scale,
         None,
     )
-    expected_loss = (expected_global + expected_caption) / 2
 
     assert torch.isfinite(loss)
     assert torch.isfinite(loss_dict["loss_align"])
-    assert torch.allclose(loss, expected_loss)
-    assert torch.allclose(loss_dict["loss_align_global"], expected_global.detach())
+    assert torch.allclose(loss, expected_caption)
+    assert loss_dict["loss_align_global"].item() == 0.0
     assert torch.allclose(loss_dict["loss_align_caption"], expected_caption.detach())
     loss.backward()
     assert caption_visual_features.grad is not None
     assert caption_text_features.grad is not None
-    assert image_features.grad is not None
-    assert text_features.grad is not None
+
+
+def test_spvd_loss_rejects_flat_caption_alignment_features() -> None:
+    outputs = {
+        "caption_semantic_visual_features": torch.randn(2, 8, requires_grad=True),
+        "caption_text_features": torch.randn(2, 8, requires_grad=True),
+        "logit_scale": torch.tensor(10.0),
+    }
+    loss_fn = SPVDLoss(rank=0, world_size=1)
+
+    with pytest.raises(ValueError, match=r"\[B, K, D\]"):
+        loss_fn(outputs)
 
 
 def test_spvd_loss_sigmoid_branch_terms_are_finite() -> None:
-    image_features = torch.randn(5, 8, requires_grad=True)
-    text_features = torch.randn(5, 8, requires_grad=True)
-    residual_features = torch.randn(5, 8, requires_grad=True)
-    gate_logits = torch.randn(5, 4, 6)
+    image_features = torch.randn(2, 3, 8, requires_grad=True)
+    text_features = torch.randn(2, 3, 8, requires_grad=True)
+    residual_features = torch.randn(2, 3, 8, requires_grad=True)
+    gate_logits = torch.randn(2, 3, 4, 6)
     sigmoid_map = torch.sigmoid(gate_logits)
     outputs = {
-        "image_features": image_features,
-        "text_features": text_features,
+        "caption_semantic_visual_features": image_features,
+        "caption_text_features": text_features,
         "residual_visual_features": residual_features,
         "gate_logits": gate_logits,
         "sigmoid_map": sigmoid_map,
@@ -204,7 +205,16 @@ def test_masked_caption_siglip_masks_same_image_subcaptions() -> None:
     assert text.grad is not None
 
 
-def test_masked_caption_region_soft_signed_activates_pos_and_neg() -> None:
+def test_masked_caption_siglip_rejects_flat_caption_features() -> None:
+    loss_fn = MaskedCaptionSigLipLoss()
+    image = torch.randn(2, 8)
+    text = torch.randn(2, 8)
+
+    with pytest.raises(ValueError, match=r"\[B, K, D\]"):
+        loss_fn(image, text, torch.tensor(10.0))
+
+
+def test_masked_caption_signed_uses_iou_positive_and_low_overlap_negative() -> None:
     bsz, num_captions, num_soft_cues, num_tokens, dim = 1, 3, 1, 4, 8
     image = torch.randn(bsz, num_captions, dim, requires_grad=True)
     text = torch.randn(bsz, num_captions, dim, requires_grad=True)
@@ -212,71 +222,65 @@ def test_masked_caption_region_soft_signed_activates_pos_and_neg() -> None:
         [[[[1.0, 1.0, 0.0, 0.0]], [[1.0, 1.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 1.0]]]]
     ).reshape(bsz, num_captions, num_soft_cues, num_tokens)
     loss_fn = MaskedCaptionSigLipLoss(
-        caption_same_image_mode="region_soft_signed",
-        caption_region_pos_weight=0.05,
-        caption_region_neg_weight=0.01,
-        caption_region_warmup_steps=0,
-        caption_region_pos_min_overlap=0.3,
-        caption_region_neg_max_overlap=0.1,
+        caption_same_image_mode="signed",
+        same_image_iou_threshold=0.3,
     )
 
     loss, stats = loss_fn(image, text, torch.tensor(10.0), sigmoid_map=sigmoid_map)
+    labels, weights, _ = loss_fn.build_labels_and_weights(
+        torch.zeros(bsz * num_captions, bsz * num_captions),
+        bsz,
+        num_captions,
+        sigmoid_map,
+    )
 
     assert torch.isfinite(loss)
-    assert stats["caption_region_positive_active_fraction"].item() > 0.0
-    assert stats["caption_region_negative_active_fraction"].item() > 0.0
-    assert stats["caption_region_positive_weight_sum"].item() > 0.0
-    assert stats["caption_region_negative_weight_sum"].item() > 0.0
-    assert torch.isfinite(stats["caption_region_positive_loss"])
-    assert torch.isfinite(stats["caption_region_negative_loss"])
+    assert labels[0, 1].item() > 0.3
+    assert labels[0, 2].item() == -1.0
+    assert weights[0, 1].item() == labels[0, 1].item()
+    assert weights[0, 2].item() == 1.0
     assert stats["caption_same_image_mode_code"].item() == 2.0
     loss.backward()
     assert image.grad is not None
     assert text.grad is not None
 
 
-def test_masked_caption_region_threshold_gap_is_ignored() -> None:
+def test_masked_caption_positive_threshold_gap_is_ignored() -> None:
     image = torch.randn(1, 2, 8, requires_grad=True)
     text = torch.randn(1, 2, 8, requires_grad=True)
     sigmoid_map = torch.tensor([[[[1.0, 0.0, 0.0, 0.0]], [[0.2, 0.8, 0.0, 0.0]]]])
     loss_fn = MaskedCaptionSigLipLoss(
-        caption_same_image_mode="region_soft_signed",
-        caption_region_pos_weight=0.05,
-        caption_region_neg_weight=0.01,
-        caption_region_pos_min_overlap=0.3,
-        caption_region_neg_max_overlap=0.1,
+        caption_same_image_mode="positive",
+        same_image_iou_threshold=0.3,
     )
 
     loss, stats = loss_fn(image, text, torch.tensor(10.0), sigmoid_map=sigmoid_map)
+    labels, weights, _ = loss_fn.build_labels_and_weights(torch.zeros(2, 2), 1, 2, sigmoid_map)
 
     assert torch.isfinite(loss)
-    assert stats["caption_region_positive_weight_sum"].item() == 0.0
-    assert stats["caption_region_negative_weight_sum"].item() == 0.0
-    assert stats["caption_region_positive_active_fraction"].item() == 0.0
-    assert stats["caption_region_negative_active_fraction"].item() == 0.0
+    assert labels[0, 1].item() == 0.0
+    assert weights[0, 1].item() == 0.0
+    assert stats["caption_num_ignored_pairs"].item() == 2.0
 
 
-def test_masked_caption_region_soft_positive_has_no_negative_term() -> None:
+def test_masked_caption_positive_mode_has_no_same_image_negative() -> None:
     image = torch.randn(1, 3, 8, requires_grad=True)
     text = torch.randn(1, 3, 8, requires_grad=True)
     sigmoid_map = torch.tensor(
         [[[[1.0, 1.0, 0.0, 0.0]], [[1.0, 1.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 1.0]]]]
     )
     loss_fn = MaskedCaptionSigLipLoss(
-        caption_same_image_mode="region_soft_positive",
-        caption_region_pos_weight=0.05,
-        caption_region_neg_weight=0.02,
-        caption_region_pos_min_overlap=0.3,
-        caption_region_neg_max_overlap=0.1,
+        caption_same_image_mode="positive",
+        same_image_iou_threshold=0.3,
     )
 
     loss, stats = loss_fn(image, text, torch.tensor(10.0), sigmoid_map=sigmoid_map)
+    labels, weights, _ = loss_fn.build_labels_and_weights(torch.zeros(3, 3), 1, 3, sigmoid_map)
 
     assert torch.isfinite(loss)
-    assert stats["caption_region_positive_active_fraction"].item() > 0.0
-    assert stats["caption_region_negative_loss"].item() == 0.0
-    assert stats["caption_region_negative_weight_sum"].item() == 0.0
-    assert stats["caption_region_negative_active_fraction"].item() == 0.0
+    assert labels[0, 1].item() > 0.3
+    assert weights[0, 2].item() == 0.0
+    assert labels[0, 2].item() == 0.0
     assert stats["caption_same_image_mode_code"].item() == 1.0
 
 
@@ -287,13 +291,30 @@ def test_masked_caption_ignore_mode_keeps_region_terms_zero() -> None:
     loss_fn = MaskedCaptionSigLipLoss(caption_same_image_mode="ignore")
 
     loss, stats = loss_fn(image, text, torch.tensor(10.0), sigmoid_map=sigmoid_map)
+    labels, weights, _ = loss_fn.build_labels_and_weights(torch.zeros(3, 3), 1, 3, sigmoid_map)
 
     assert torch.isfinite(loss)
-    assert stats["caption_region_positive_loss"].item() == 0.0
-    assert stats["caption_region_negative_loss"].item() == 0.0
-    assert stats["caption_region_positive_weight_sum"].item() == 0.0
-    assert stats["caption_region_negative_weight_sum"].item() == 0.0
+    assert torch.all(weights[torch.tensor([[False, True, True], [True, False, True], [True, True, False]])] == 0)
+    assert torch.all(labels.diag() == 1)
+    assert torch.all(labels[torch.tensor([[False, True, True], [True, False, True], [True, True, False]])] == 0)
     assert stats["caption_same_image_mode_code"].item() == 0.0
+
+
+def test_masked_caption_ddp_adds_negative_only_text_batches(monkeypatch: pytest.MonkeyPatch) -> None:
+    bsz, num_captions, dim = 2, 2, 8
+    image = torch.randn(bsz, num_captions, dim, requires_grad=True)
+    text = torch.randn(bsz, num_captions, dim, requires_grad=True)
+    other_text = F.normalize(torch.randn(bsz * num_captions, dim), dim=-1)
+    loss_fn = MaskedCaptionSigLipLoss(world_size=2, rank=0)
+
+    monkeypatch.setattr(loss_fn, "_negative_text_feature_batches", lambda _: [other_text])
+    loss, stats = loss_fn(image, text, torch.tensor(10.0))
+
+    assert torch.isfinite(loss)
+    assert stats["caption_ddp_negative_loss"].item() > 0.0
+    loss.backward()
+    assert image.grad is not None
+    assert text.grad is not None
 
 
 def test_spvd_loss_masked_caption_path_with_global_disabled() -> None:
@@ -301,9 +322,9 @@ def test_spvd_loss_masked_caption_path_with_global_disabled() -> None:
     gate_logits = torch.randn(bsz, num_captions, 4, 6)
     sigmoid_map = torch.sigmoid(gate_logits)
     outputs = {
-        "shared_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
+        "caption_semantic_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "caption_text_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
-        "text_features": torch.randn(bsz, dim, requires_grad=True),
+        "text_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "residual_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "gate_logits": gate_logits,
         "sigmoid_map": sigmoid_map,
@@ -336,7 +357,7 @@ def test_spvd_loss_masked_caption_path_with_global_disabled() -> None:
     assert torch.allclose(loss_dict["loss_branch_weight_effective"], torch.tensor(0.025))
     assert torch.allclose(loss_dict["loss_residual_variance_weight_effective"], torch.tensor(0.01))
     loss.backward()
-    assert outputs["shared_visual_features"].grad is not None
+    assert outputs["caption_semantic_visual_features"].grad is not None
     assert outputs["caption_text_features"].grad is not None
 
 
@@ -347,9 +368,9 @@ def test_spvd_loss_passes_sigmoid_map_to_region_caption_loss() -> None:
         [[[[1.0, 1.0, 0.0, 0.0]], [[1.0, 1.0, 0.0, 0.0]], [[0.0, 0.0, 1.0, 1.0]]]]
     )
     outputs = {
-        "shared_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
+        "caption_semantic_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "caption_text_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
-        "text_features": torch.randn(bsz, dim, requires_grad=True),
+        "text_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "residual_visual_features": torch.randn(bsz, num_captions, dim, requires_grad=True),
         "gate_logits": gate_logits,
         "sigmoid_map": sigmoid_map,
@@ -362,9 +383,7 @@ def test_spvd_loss_passes_sigmoid_map_to_region_caption_loss() -> None:
         global_align_weight=0.0,
         caption_align_weight=1.0,
         caption_loss_impl="masked_sigmoid",
-        caption_same_image_mode="region_soft_positive",
-        caption_region_pos_weight=0.05,
-        caption_region_warmup_steps=10,
+        caption_same_image_mode="positive",
         branch_bce_weight=0.0,
         residual_variance_weight=0.0,
     )
@@ -373,9 +392,8 @@ def test_spvd_loss_passes_sigmoid_map_to_region_caption_loss() -> None:
     loss, loss_dict = loss_fn(outputs)
 
     assert torch.isfinite(loss)
-    assert loss_dict["caption_region_positive_active_fraction"].item() > 0.0
-    assert torch.allclose(loss_dict["caption_region_pos_weight_effective"], torch.tensor(0.025))
-    assert loss_dict["caption_region_neg_weight_effective"].item() == 0.0
+    assert loss_dict["caption_same_image_mode_code"].item() == 1.0
+    assert loss_dict["caption_num_positive_pairs"].item() > bsz * num_captions
     loss.backward()
-    assert outputs["shared_visual_features"].grad is not None
+    assert outputs["caption_semantic_visual_features"].grad is not None
     assert outputs["caption_text_features"].grad is not None
